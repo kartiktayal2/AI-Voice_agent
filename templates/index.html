@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Voice Agent</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 700px;
+            margin: 40px auto;
+        }
+
+        h1 {
+            text-align: center;
+        }
+
+        #chat {
+            border: 1px solid #ccc;
+            padding: 20px;
+            height: 400px;
+            overflow-y: auto;
+            margin-bottom: 20px;
+        }
+
+        .user {
+            margin: 10px 0;
+        }
+
+        .ai {
+            margin: 10px 0;
+        }
+
+        #startButton {
+            display: block;
+            margin: auto;
+            padding: 12px 25px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        #status {
+            text-align: center;
+            font-weight: bold;
+            margin: 20px;
+        }
+    </style>
+</head>
+
+<body>
+
+<h1>AI Voice Agent</h1>
+
+<div id="chat"></div>
+
+<button id="startButton">
+    🎤 Start Voice Agent
+</button>
+
+<div id="status">
+    Click Start Voice Agent
+</div>
+
+
+<script>
+
+let stream = null;
+let recorder = null;
+let chunks = [];
+
+let audioContext = null;
+let analyser = null;
+let microphone = null;
+
+let agentRunning = false;
+let recording = false;
+
+let silenceStart = null;
+
+const SILENCE_LIMIT = 1500;
+
+// Adjust this later if necessary.
+const SPEECH_THRESHOLD = 0.02;
+
+
+const button = document.getElementById("startButton");
+const status = document.getElementById("status");
+const chat = document.getElementById("chat");
+
+
+/*
+    START / STOP WHOLE VOICE AGENT
+*/
+
+button.onclick = async function () {
+
+    if (agentRunning) {
+        stopAgent();
+        return;
+    }
+
+    try {
+
+        stream = await navigator.mediaDevices.getUserMedia({
+            audio: true
+        });
+
+
+        audioContext = new AudioContext();
+
+        analyser = audioContext.createAnalyser();
+
+        analyser.fftSize = 2048;
+
+
+        microphone =
+            audioContext.createMediaStreamSource(stream);
+
+        microphone.connect(analyser);
+
+
+        agentRunning = true;
+
+        button.innerText =
+            "⏹ Stop Voice Agent";
+
+        status.innerText =
+            "🎤 Listening...";
+
+
+        monitorAudio();
+
+
+    } catch (error) {
+
+        console.error(error);
+
+        status.innerText =
+            "❌ Microphone permission denied";
+
+    }
+
+};
+
+
+/*
+    MONITOR MICROPHONE
+*/
+
+function monitorAudio() {
+
+    if (!agentRunning) {
+        return;
+    }
+
+
+    const data =
+        new Uint8Array(analyser.fftSize);
+
+
+    analyser.getByteTimeDomainData(data);
+
+
+    let sum = 0;
+
+
+    for (let i = 0; i < data.length; i++) {
+
+        const value =
+            (data[i] - 128) / 128;
+
+        sum += value * value;
+
+    }
+
+
+    const volume =
+        Math.sqrt(sum / data.length);
+
+
+    /*
+        SPEECH DETECTED
+    */
+
+    if (volume > SPEECH_THRESHOLD) {
+
+        silenceStart = null;
+
+
+        if (!recording) {
+
+            console.log("Speech detected");
+
+            startRecording();
+
+        }
+
+
+        status.innerText =
+            "🎤 Recording...";
+
+    }
+
+
+    /*
+        SILENCE DETECTED
+    */
+
+    else {
+
+        if (recording) {
+
+            if (silenceStart === null) {
+
+                silenceStart = Date.now();
+
+            }
+
+
+            const silenceTime =
+                Date.now() - silenceStart;
+
+
+            /*
+                User has stopped speaking
+            */
+
+            if (silenceTime >= SILENCE_LIMIT) {
+
+                console.log(
+                    "Sentence finished."
+                );
+
+                stopRecording();
+
+                return;
+
+            }
+
+        }
+
+    }
+
+
+    requestAnimationFrame(monitorAudio);
+
+}
+
+
+/*
+    START RECORDING
+*/
+
+function startRecording() {
+
+    if (recording) {
+        return;
+    }
+
+
+    chunks = [];
+
+
+    recorder =
+        new MediaRecorder(stream);
+
+
+    recorder.ondataavailable =
+        function (event) {
+
+            if (event.data.size > 0) {
+
+                chunks.push(event.data);
+
+            }
+
+        };
+
+
+    recorder.onstop =
+        async function () {
+
+            recording = false;
+
+            status.innerText =
+                "⏳ Processing...";
+
+
+            const audioBlob =
+                new Blob(
+                    chunks,
+                    {
+                        type: "audio/webm"
+                    }
+                );
+
+
+            const formData =
+                new FormData();
+
+
+            formData.append(
+                "file",
+                audioBlob,
+                "voice.webm"
+            );
+
+
+            try {
+
+                const response =
+                    await fetch(
+                        "/voice",
+                        {
+                            method: "POST",
+                            body: formData
+                        }
+                    );
+
+
+                const data =
+                    await response.json();
+
+
+                /*
+                    USER TEXT
+                */
+
+                chat.innerHTML += `
+                    <div class="user">
+                        <b>You:</b>
+                        ${data.user_text || ""}
+                    </div>
+                `;
+
+
+                /*
+                    AI RESPONSE
+                */
+
+                chat.innerHTML += `
+                    <div class="ai">
+                        <b>AI:</b>
+                        ${data.response || ""}
+                    </div>
+                `;
+
+
+                chat.scrollTop =
+                    chat.scrollHeight;
+
+
+                /*
+                    PLAY AI VOICE
+                */
+
+                if (data.audio) {
+
+                    const audio =
+                        new Audio(
+                            data.audio +
+                            "?t=" +
+                            Date.now()
+                        );
+
+
+                    await audio.play();
+
+                }
+
+
+                status.innerText =
+                    "🎤 Listening...";
+
+
+            } catch (error) {
+
+                console.error(error);
+
+                status.innerText =
+                    "❌ Error processing voice";
+
+            }
+
+
+            chunks = [];
+
+            recorder = null;
+
+            silenceStart = null;
+
+
+            /*
+                Start listening for
+                the next sentence.
+            */
+
+            if (agentRunning) {
+
+                requestAnimationFrame(
+                    monitorAudio
+                );
+
+            }
+
+        };
+
+
+    recorder.start();
+
+    recording = true;
+
+}
+
+
+/*
+    STOP CURRENT SENTENCE
+*/
+
+function stopRecording() {
+
+    if (
+        recorder &&
+        recorder.state === "recording"
+    ) {
+
+        recorder.stop();
+
+    }
+
+}
+
+
+/*
+    STOP WHOLE VOICE AGENT
+*/
+
+function stopAgent() {
+
+    agentRunning = false;
+
+
+    if (
+        recorder &&
+        recorder.state === "recording"
+    ) {
+
+        recorder.stop();
+
+    }
+
+
+    if (stream) {
+
+        stream
+            .getTracks()
+            .forEach(
+                track => track.stop()
+            );
+
+    }
+
+
+    if (audioContext) {
+
+        audioContext.close();
+
+    }
+
+
+    stream = null;
+
+    recorder = null;
+
+    recording = false;
+
+
+    button.innerText =
+        "🎤 Start Voice Agent";
+
+
+    status.innerText =
+        "Voice agent stopped.";
+
+}
+
+</script>
+
+</body>
+</html>

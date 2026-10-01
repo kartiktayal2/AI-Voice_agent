@@ -1,0 +1,26 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated audio
+audio/*.wav
+audio/*.webm
+
+# Local chat/session data
+chat_history.json
+
+# Local model files
+models/
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
