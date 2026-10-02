@@ -27,7 +27,7 @@ INPUT_AUDIO = r"audio\browser_input.webm"
 
 OUTPUT_AUDIO = r"audio\browser_response.wav"
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_URL = "http://ollama.railway.internal:11434/api/chat"
 
 OLLAMA_MODEL = "qwen2.5:0.5b"
 
