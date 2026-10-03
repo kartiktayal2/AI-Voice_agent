@@ -1,13 +1,13 @@
 import time
+import os
+import subprocess
+import requests
+
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 from faster_whisper import WhisperModel
-
-import requests
-import os
-import subprocess
 
 
 app = FastAPI()
@@ -19,16 +19,16 @@ app = FastAPI()
 
 WHISPER_MODEL = "base"
 
-PIPER_EXE = r".venv\Scripts\piper.exe"
+# Piper
+PIPER_EXE = "python"
+PIPER_MODEL = "en_US-lessac-medium"
 
-PIPER_MODEL = r"models\piper\en_US-lessac-medium.onnx"
+# Audio files
+INPUT_AUDIO = "audio/browser_input.webm"
+OUTPUT_AUDIO = "audio/browser_response.wav"
 
-INPUT_AUDIO = r"audio\browser_input.webm"
-
-OUTPUT_AUDIO = r"audio\browser_response.wav"
-
+# Ollama
 OLLAMA_URL = "http://ollama.railway.internal:11434/api/chat"
-
 OLLAMA_MODEL = "qwen2.5:0.5b"
 
 
@@ -36,21 +36,13 @@ OLLAMA_MODEL = "qwen2.5:0.5b"
 # Conversation History
 # ============================================================
 #
-# IMPORTANT:
-# History is stored ONLY in RAM.
+# History is stored only in RAM.
 #
-# When the server starts:
-#     history = []
+# Server starts  -> empty conversation
+# During runtime -> conversation is remembered
+# Server stops   -> history disappears
 #
-# During the current run:
-#     conversation is remembered
-#
-# When the server stops:
-#     history disappears
-#
-# When the server starts again:
-#     completely new conversation
-#
+# ============================================================
 
 history = []
 
@@ -107,7 +99,7 @@ def home():
         return file.read()
 
 
-## ============================================================
+# ============================================================
 # Ollama
 # ============================================================
 
@@ -115,15 +107,13 @@ def ask_ollama(user_message):
 
     global history
 
-    # Add user message to current RAM conversation
+    # Add user message to conversation
     history.append({
         "role": "user",
         "content": user_message
     })
 
-    # --------------------------------------------------------
-    # Keep only the latest 4 messages
-    # --------------------------------------------------------
+    # Keep only recent messages
     recent_history = history[-4:]
 
     print("\nAsking Ollama...")
@@ -144,7 +134,6 @@ def ask_ollama(user_message):
 
             "stream": False,
 
-            # Limit response generation
             "options": {
                 "num_predict": 100
             }
@@ -159,7 +148,7 @@ def ask_ollama(user_message):
 
     ai_response = data["message"]["content"].strip()
 
-    # Save AI response in current RAM conversation
+    # Save AI response
     history.append({
         "role": "assistant",
         "content": ai_response
@@ -194,21 +183,29 @@ def chat(request: ChatRequest):
     }
 
 
+# ============================================================
+# Voice
+# ============================================================
+
 @app.post("/voice")
 async def voice(file: UploadFile = File(...)):
 
     print("\n" + "=" * 50)
-
     print("VOICE INPUT RECEIVED")
 
     total_start = time.time()
 
 
     # --------------------------------------------------------
-    # Save browser audio
+    # Save Browser Audio
     # --------------------------------------------------------
 
     audio_data = await file.read()
+
+    os.makedirs(
+        "audio",
+        exist_ok=True
+    )
 
     with open(
         INPUT_AUDIO,
@@ -252,8 +249,15 @@ async def voice(file: UploadFile = File(...)):
     print("\nUSER:")
     print(user_text)
 
-    print(f"\nWhisper time: {whisper_time:.2f} seconds")
+    print(
+        f"\nWhisper time: "
+        f"{whisper_time:.2f} seconds"
+    )
 
+
+    # --------------------------------------------------------
+    # No Speech Detected
+    # --------------------------------------------------------
 
     if not user_text:
 
@@ -270,8 +274,6 @@ async def voice(file: UploadFile = File(...)):
 
     ollama_start = time.time()
 
-    
-
     ai_response = ask_ollama(
         user_text
     )
@@ -281,7 +283,10 @@ async def voice(file: UploadFile = File(...)):
     print("\nAI:")
     print(ai_response)
 
-    print(f"\nOllama time: {ollama_time:.2f} seconds")
+    print(
+        f"\nOllama time: "
+        f"{ollama_time:.2f} seconds"
+    )
 
 
     # --------------------------------------------------------
@@ -293,17 +298,25 @@ async def voice(file: UploadFile = File(...)):
     print("\nGenerating voice...")
 
     subprocess.run(
+
         [
             PIPER_EXE,
+            "-m",
+            "piper",
             "-m",
             PIPER_MODEL,
             "-f",
             OUTPUT_AUDIO
         ],
+
         input=ai_response,
+
         text=True,
+
         encoding="utf-8",
+
         errors="replace",
+
         check=True
     )
 
@@ -311,95 +324,52 @@ async def voice(file: UploadFile = File(...)):
 
     print("Voice generated.")
 
-    print(f"Piper time: {piper_time:.2f} seconds")
+    print(
+        f"Piper time: "
+        f"{piper_time:.2f} seconds"
+    )
 
 
     # --------------------------------------------------------
-    # Total
+    # Total Processing Time
     # --------------------------------------------------------
 
     total_time = time.time() - total_start
 
     print("\n" + "-" * 50)
 
-    print(f"Whisper : {whisper_time:.2f}s")
-    print(f"Ollama  : {ollama_time:.2f}s")
-    print(f"Piper   : {piper_time:.2f}s")
-    print(f"TOTAL   : {total_time:.2f}s")
+    print(
+        f"Whisper : "
+        f"{whisper_time:.2f}s"
+    )
+
+    print(
+        f"Ollama  : "
+        f"{ollama_time:.2f}s"
+    )
+
+    print(
+        f"Piper   : "
+        f"{piper_time:.2f}s"
+    )
+
+    print(
+        f"TOTAL   : "
+        f"{total_time:.2f}s"
+    )
 
     print("-" * 50)
 
     print("=" * 50)
 
 
-    return {
-        "user_text": user_text,
-        "response": ai_response,
-        "audio": "/voice-response"
-    }
-
-
-# ============================================================
-# Voice Response
-# ============================================================
-
-@app.get("/voice-response")
-def voice_response():
-
-    return FileResponse(
-        OUTPUT_AUDIO,
-        media_type="audio/wav"
-    )
-    print("\nAI:")
-    print(ai_response)
-
-
     # --------------------------------------------------------
-    # Text → Speech
-    # --------------------------------------------------------
-
-    print("\nGenerating voice...")
-
-
-    subprocess.run(
-
-        [
-            PIPER_EXE,
-
-            "-m",
-            PIPER_MODEL,
-
-            "-f",
-            OUTPUT_AUDIO
-        ],
-
-        input=ai_response,
-
-        text=True,
-
-        encoding="utf-8",
-
-        errors="replace",
-
-        check=True
-    )
-
-
-    print("Voice generated.")
-
-    print("=" * 50)
-
-
-    # --------------------------------------------------------
-    # Return everything to frontend
+    # Return Result
     # --------------------------------------------------------
 
     return {
-
         "user_text": user_text,
-
         "response": ai_response,
-
         "audio": "/voice-response"
     }
 
@@ -412,8 +382,6 @@ def voice_response():
 def voice_response():
 
     return FileResponse(
-
         OUTPUT_AUDIO,
-
         media_type="audio/wav"
     )
