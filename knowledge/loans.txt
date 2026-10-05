@@ -1,0 +1,36 @@
+Personal Loan
+
+The personal loan amount ranges from ₹50,000 to ₹10,00,000.
+
+The interest rate for a personal loan starts from 10.5% per annum.
+
+The maximum repayment tenure for a personal loan is 7 years.
+
+The processing fee is 1% of the approved loan amount.
+
+
+Personal Loan Eligibility
+
+The applicant must be at least 21 years old.
+
+The applicant must have a regular source of income.
+
+The applicant must have a valid PAN card.
+
+The applicant must provide valid identity and address proof.
+
+
+Loan Application
+
+Customers can apply for a personal loan by submitting the required application and documents.
+
+The application is subject to eligibility verification and approval.
+
+Loan approval is not guaranteed and depends on the applicant's eligibility and verification.
+
+
+Loan Repayment
+
+Customers must repay the approved loan according to the agreed repayment schedule.
+
+The exact monthly installment depends on the loan amount, interest rate, and repayment tenure.
