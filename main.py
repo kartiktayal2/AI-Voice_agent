@@ -50,11 +50,13 @@ history = []
 # ============================================================
 
 SYSTEM_PROMPT = (
-    "You are a customer support voice assistant. "
-    "Give short, direct and conversational answers. "
-    "Keep responses under 80 words unless the user asks "
-    "for a detailed explanation. "
-    "Do not repeat information unnecessarily."
+    "You are a customer support voice assistant."
+    "Give short, direct, conversational answers."
+    "Answer in 1-2 sentences."
+    "Keep every response under 35 words until the user asks for more details."
+    "Do not provide lists unless the user asks."
+    "Do not repeat information."
+    "Always finish your sentence."
 )
 
 
@@ -153,7 +155,7 @@ def ask_ollama(user_message):
             "stream": False,
 
             "options": {
-                "num_predict": 100
+                "num_predict": 60
             }
         },
 
@@ -245,11 +247,11 @@ async def voice(file: UploadFile = File(...)):
     print("\nTranscribing...")
 
     segments, info = whisper_model.transcribe(
-
         INPUT_AUDIO,
-
+        language="en",
+        beam_size=1,
+        condition_on_previous_text=False,
         vad_filter=True,
-
         vad_parameters={
             "min_silence_duration_ms": 2000,
             "speech_pad_ms": 400
