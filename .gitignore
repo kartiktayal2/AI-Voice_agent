@@ -14,6 +14,8 @@ chat_history.json
 
 # Local model files
 models/
+en_US-lessac-medium.onnx
+en_US-lessac-medium.onnx.json
 
 # Environment variables
 .env

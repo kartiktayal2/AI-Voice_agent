@@ -1,6 +1,6 @@
 import time
 import os
-import subprocess
+import wave
 import requests
 
 from fastapi import FastAPI, UploadFile, File
@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 from faster_whisper import WhisperModel
+from piper import PiperVoice
 
 
 app = FastAPI()
@@ -17,32 +18,29 @@ app = FastAPI()
 # Configuration
 # ============================================================
 
-WHISPER_MODEL = "base"
+WHISPER_MODEL = "distil-small.en"
 
 # Piper
-PIPER_EXE = "python"
-PIPER_MODEL = "en_US-lessac-medium"
+PIPER_MODEL = "en_US-lessac-medium.onnx"
 
 # Audio files
 INPUT_AUDIO = "audio/browser_input.webm"
 OUTPUT_AUDIO = "audio/browser_response.wav"
 
-# Ollama
-OLLAMA_URL = "http://ollama.railway.internal:11434/api/chat"
+# Local Ollama
+OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "qwen2.5:0.5b"
 
 
 # ============================================================
 # Conversation History
 # ============================================================
-#
-# History is stored only in RAM.
+
+# Stored only in RAM.
 #
 # Server starts  -> empty conversation
 # During runtime -> conversation is remembered
 # Server stops   -> history disappears
-#
-# ============================================================
 
 history = []
 
@@ -52,11 +50,13 @@ history = []
 # ============================================================
 
 SYSTEM_PROMPT = (
-    "You are a customer support voice assistant. "
-    "Give short, direct and conversational answers. "
-    "Keep responses under 80 words unless the user asks "
-    "for a detailed explanation. "
-    "Do not repeat information unnecessarily."
+    "You are a customer support voice assistant."
+    "Give short, direct, conversational answers."
+    "Answer in 1-2 sentences."
+    "Keep every response under 35 words until the user asks for more details."
+    "Do not provide lists unless the user asks."
+    "Do not repeat information."
+    "Always finish your sentence."
 )
 
 
@@ -73,6 +73,26 @@ whisper_model = WhisperModel(
 )
 
 print("Whisper loaded.")
+
+
+# ============================================================
+# Load Piper
+# ============================================================
+
+print("Loading Piper...")
+
+piper_start = time.time()
+
+piper_voice = PiperVoice.load(
+    PIPER_MODEL
+)
+
+piper_load_time = time.time() - piper_start
+
+print(
+    f"Piper loaded in "
+    f"{piper_load_time:.2f} seconds."
+)
 
 
 # ============================================================
@@ -107,7 +127,7 @@ def ask_ollama(user_message):
 
     global history
 
-    # Add user message to conversation
+    # Add user message
     history.append({
         "role": "user",
         "content": user_message
@@ -135,7 +155,7 @@ def ask_ollama(user_message):
             "stream": False,
 
             "options": {
-                "num_predict": 100
+                "num_predict": 60
             }
         },
 
@@ -201,6 +221,7 @@ async def voice(file: UploadFile = File(...)):
     # --------------------------------------------------------
 
     audio_data = await file.read()
+    print(f"Audio file size: {len(audio_data) / 1024:.2f} KB")
 
     os.makedirs(
         "audio",
@@ -226,11 +247,11 @@ async def voice(file: UploadFile = File(...)):
     print("\nTranscribing...")
 
     segments, info = whisper_model.transcribe(
-
         INPUT_AUDIO,
-
+        language="en",
+        beam_size=1,
+        condition_on_previous_text=False,
         vad_filter=True,
-
         vad_parameters={
             "min_silence_duration_ms": 2000,
             "speech_pad_ms": 400
@@ -240,6 +261,7 @@ async def voice(file: UploadFile = File(...)):
     user_text = ""
 
     for segment in segments:
+
         user_text += segment.text + " "
 
     user_text = user_text.strip()
@@ -297,35 +319,25 @@ async def voice(file: UploadFile = File(...)):
 
     print("\nGenerating voice...")
 
-    subprocess.run(
+    # Piper was already loaded when the server started.
+    # We reuse the same loaded model here.
 
-        [
-            PIPER_EXE,
-            "-m",
-            "piper",
-            "-m",
-            PIPER_MODEL,
-            "-f",
-            OUTPUT_AUDIO
-        ],
+    with wave.open(
+        OUTPUT_AUDIO,
+        "wb"
+    ) as wav_file:
 
-        input=ai_response,
-
-        text=True,
-
-        encoding="utf-8",
-
-        errors="replace",
-
-        check=True
-    )
+        piper_voice.synthesize_wav(
+            ai_response,
+            wav_file
+        )
 
     piper_time = time.time() - piper_start
 
     print("Voice generated.")
 
     print(
-        f"Piper time: "
+        f"Piper generation time: "
         f"{piper_time:.2f} seconds"
     )
 

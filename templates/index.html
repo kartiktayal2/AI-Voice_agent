@@ -63,6 +63,10 @@
 
 <script>
 
+/* =========================================================
+   GLOBAL VARIABLES
+   ========================================================= */
+
 let stream = null;
 let recorder = null;
 let chunks = [];
@@ -71,61 +75,190 @@ let audioContext = null;
 let analyser = null;
 let microphone = null;
 
+let currentAudio = null;
+
 let agentRunning = false;
-let recording = false;
 
-let silenceStart = null;
+/*
+    State machine:
 
-const SILENCE_LIMIT = 1500;
+    STOPPED
+    LISTENING
+    RECORDING
+    PROCESSING
+    SPEAKING
+*/
 
-// Adjust this later if necessary.
-const SPEECH_THRESHOLD = 0.02;
+let state = "STOPPED";
+
+let animationFrameId = null;
 
 
-const button = document.getElementById("startButton");
-const status = document.getElementById("status");
-const chat = document.getElementById("chat");
+/* =========================================================
+   SPEECH DETECTION SETTINGS
+   ========================================================= */
+
+/*
+    How loud audio must be before we consider it
+    possible speech.
+
+    0.02 was too sensitive in your environment
+    because of the ceiling fan.
+
+    Start with 0.035.
+*/
+const SPEECH_THRESHOLD = 0.035;
 
 
 /*
-    START / STOP WHOLE VOICE AGENT
+    Audio must remain above the threshold for this
+    amount of time before we decide that the user
+    actually started speaking.
+
+    This prevents small noise spikes from starting
+    a recording.
 */
+const SPEECH_CONFIRMATION_TIME = 250;
+
+
+/*
+    User must remain quiet for this amount of time
+    before we decide the sentence has ended.
+*/
+const SILENCE_LIMIT = 1200;
+
+
+/*
+    Ignore extremely short recordings.
+*/
+const MIN_RECORDING_TIME = 500;
+
+
+/*
+    Minimum blob size.
+
+    This is only a secondary safety check.
+    We do NOT use file size as the main
+    speech detection mechanism.
+*/
+const MIN_AUDIO_SIZE = 10000;
+
+
+/* =========================================================
+   SPEECH DETECTION VARIABLES
+   ========================================================= */
+
+let speechCandidateStart = null;
+let silenceStart = null;
+
+let recordingStartTime = null;
+
+
+/* =========================================================
+   DOM ELEMENTS
+   ========================================================= */
+
+const button =
+    document.getElementById("startButton");
+
+const status =
+    document.getElementById("status");
+
+const chat =
+    document.getElementById("chat");
+
+
+/* =========================================================
+   START / STOP WHOLE VOICE AGENT
+   ========================================================= */
 
 button.onclick = async function () {
 
     if (agentRunning) {
+
         stopAgent();
+
         return;
     }
 
+
     try {
 
-        stream = await navigator.mediaDevices.getUserMedia({
-            audio: true
-        });
+        /*
+            Important microphone settings.
+
+            echoCancellation:
+            Helps prevent the AI's speaker output
+            from being detected as user speech.
+
+            noiseSuppression:
+            Helps reduce background noise such
+            as fans.
+
+            autoGainControl:
+            Helps normalize microphone volume.
+        */
+
+        stream =
+            await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true
+                }
+            });
 
 
-        audioContext = new AudioContext();
+        /*
+            Create audio processing context.
+        */
 
-        analyser = audioContext.createAnalyser();
+        audioContext =
+            new AudioContext();
+
+
+        /*
+            Create analyser.
+        */
+
+        analyser =
+            audioContext.createAnalyser();
 
         analyser.fftSize = 2048;
 
 
+        /*
+            Connect microphone to analyser.
+        */
+
         microphone =
-            audioContext.createMediaStreamSource(stream);
+            audioContext.createMediaStreamSource(
+                stream
+            );
 
         microphone.connect(analyser);
 
 
+        /*
+            Start agent.
+        */
+
         agentRunning = true;
+
+        state = "LISTENING";
+
 
         button.innerText =
             "⏹ Stop Voice Agent";
 
+
         status.innerText =
             "🎤 Listening...";
 
+
+        /*
+            Start ONE monitoring loop.
+        */
 
         monitorAudio();
 
@@ -142,28 +275,46 @@ button.onclick = async function () {
 };
 
 
-/*
-    MONITOR MICROPHONE
-*/
+/* =========================================================
+   MONITOR MICROPHONE
+   ========================================================= */
 
 function monitorAudio() {
+
+    /*
+        Do not create multiple monitoring loops.
+    */
 
     if (!agentRunning) {
         return;
     }
 
 
+    /*
+        Read microphone volume.
+    */
+
     const data =
-        new Uint8Array(analyser.fftSize);
+        new Uint8Array(
+            analyser.fftSize
+        );
 
 
     analyser.getByteTimeDomainData(data);
 
 
+    /*
+        Calculate RMS volume.
+    */
+
     let sum = 0;
 
 
-    for (let i = 0; i < data.length; i++) {
+    for (
+        let i = 0;
+        i < data.length;
+        i++
+    ) {
 
         const value =
             (data[i] - 128) / 128;
@@ -174,65 +325,140 @@ function monitorAudio() {
 
 
     const volume =
-        Math.sqrt(sum / data.length);
+        Math.sqrt(
+            sum / data.length
+        );
 
 
-    /*
-        SPEECH DETECTED
-    */
-
-    if (volume > SPEECH_THRESHOLD) {
-
-        silenceStart = null;
+    const now = Date.now();
 
 
-        if (!recording) {
+    /* =====================================================
+       LISTENING STATE
+       ===================================================== */
 
-            console.log("Speech detected");
+    if (state === "LISTENING") {
 
-            startRecording();
+        /*
+            Possible speech detected.
+        */
 
-        }
+        if (volume > SPEECH_THRESHOLD) {
 
+            /*
+                Start confirmation timer.
+            */
 
-        status.innerText =
-            "🎤 Recording...";
+            if (speechCandidateStart === null) {
 
-    }
-
-
-    /*
-        SILENCE DETECTED
-    */
-
-    else {
-
-        if (recording) {
-
-            if (silenceStart === null) {
-
-                silenceStart = Date.now();
+                speechCandidateStart = now;
 
             }
 
 
-            const silenceTime =
-                Date.now() - silenceStart;
+            /*
+                Has the sound remained loud enough
+                for long enough?
+            */
+
+            const speechDuration =
+                now - speechCandidateStart;
+
+
+            if (
+                speechDuration >=
+                SPEECH_CONFIRMATION_TIME
+            ) {
+
+                console.log(
+                    "Speech confirmed."
+                );
+
+
+                speechCandidateStart = null;
+
+                startRecording();
+
+            }
+
+        } else {
+
+            /*
+                Noise disappeared before the
+                confirmation period.
+
+                Ignore it.
+            */
+
+            speechCandidateStart = null;
+
+        }
+
+    }
+
+
+    /* =====================================================
+       RECORDING STATE
+       ===================================================== */
+
+    else if (state === "RECORDING") {
+
+        /*
+            User is speaking.
+        */
+
+        if (volume > SPEECH_THRESHOLD) {
+
+            /*
+                Reset silence timer.
+            */
+
+            silenceStart = null;
+
+        }
+
+        /*
+            User is quiet.
+        */
+
+        else {
+
+            if (silenceStart === null) {
+
+                silenceStart = now;
+
+            }
+
+
+            const silenceDuration =
+                now - silenceStart;
+
+
+            const recordingDuration =
+                now - recordingStartTime;
 
 
             /*
-                User has stopped speaking
+                Stop only after:
+
+                1. Enough recording time
+                2. Enough silence
             */
 
-            if (silenceTime >= SILENCE_LIMIT) {
+            if (
+                silenceDuration >=
+                    SILENCE_LIMIT
+                &&
+                recordingDuration >=
+                    MIN_RECORDING_TIME
+            ) {
 
                 console.log(
                     "Sentence finished."
                 );
 
-                stopRecording();
 
-                return;
+                stopRecording();
 
             }
 
@@ -241,49 +467,161 @@ function monitorAudio() {
     }
 
 
-    requestAnimationFrame(monitorAudio);
+    /* =====================================================
+       PROCESSING STATE
+       ===================================================== */
+
+    else if (state === "PROCESSING") {
+
+        /*
+            Do absolutely nothing.
+
+            We do NOT allow microphone noise to
+            start another recording while:
+
+            Whisper
+            Ollama
+            Piper
+
+            are working.
+        */
+
+    }
+
+
+    /* =====================================================
+       SPEAKING STATE
+       ===================================================== */
+
+    else if (state === "SPEAKING") {
+
+        /*
+            For now, don't automatically start
+            recording during AI playback.
+
+            This prevents the ceiling fan and
+            speaker output from creating another
+            recording.
+
+            Barge-in/interruption can be added
+            after the basic recording pipeline
+            is stable.
+        */
+
+    }
+
+
+    /*
+        Continue ONE monitoring loop.
+    */
+
+    animationFrameId =
+        requestAnimationFrame(
+            monitorAudio
+        );
 
 }
 
 
-/*
-    START RECORDING
-*/
+/* =========================================================
+   START RECORDING
+   ========================================================= */
 
 function startRecording() {
 
-    if (recording) {
+    /*
+        Safety checks.
+    */
+
+    if (!agentRunning) {
         return;
     }
 
 
+    if (state !== "LISTENING") {
+        return;
+    }
+
+
+    if (
+        recorder &&
+        recorder.state === "recording"
+    ) {
+        return;
+    }
+
+
+    console.log(
+        "Starting recording..."
+    );
+
+
+    /*
+        Reset recording data.
+    */
+
     chunks = [];
 
+    silenceStart = null;
+
+    recordingStartTime =
+        Date.now();
+
+
+    /*
+        Create MediaRecorder.
+    */
 
     recorder =
-        new MediaRecorder(stream);
+        new MediaRecorder(
+            stream
+        );
 
+
+    /*
+        Receive audio chunks.
+    */
 
     recorder.ondataavailable =
         function (event) {
 
-            if (event.data.size > 0) {
+            if (
+                event.data &&
+                event.data.size > 0
+            ) {
 
-                chunks.push(event.data);
+                chunks.push(
+                    event.data
+                );
 
             }
 
         };
 
 
+    /*
+        Recording stopped.
+    */
+
     recorder.onstop =
         async function () {
 
+            /*
+                Save recording duration
+                before resetting variables.
+            */
+
+            const recordingDuration =
+                Date.now() -
+                recordingStartTime;
+
+
             recording = false;
 
-            status.innerText =
-                "⏳ Processing...";
 
+            /*
+                Create audio blob.
+            */
 
             const audioBlob =
                 new Blob(
@@ -293,6 +631,114 @@ function startRecording() {
                     }
                 );
 
+
+            console.log(
+                "Recording duration:",
+                recordingDuration,
+                "ms"
+            );
+
+
+            console.log(
+                "Audio size:",
+                (
+                    audioBlob.size / 1024
+                ).toFixed(2),
+                "KB"
+            );
+
+
+            /*
+                Safety check #1:
+                Agent stopped.
+            */
+
+            if (!agentRunning) {
+
+                chunks = [];
+
+                recorder = null;
+
+                return;
+
+            }
+
+
+            /*
+                Safety check #2:
+                Recording too short.
+            */
+
+            if (
+                recordingDuration <
+                MIN_RECORDING_TIME
+            ) {
+
+                console.log(
+                    "Recording too short. Discarding."
+                );
+
+
+                chunks = [];
+
+                recorder = null;
+
+                state = "LISTENING";
+
+                status.innerText =
+                    "🎤 Listening...";
+
+                return;
+
+            }
+
+
+            /*
+                Safety check #3:
+                Very small audio file.
+            */
+
+            if (
+                audioBlob.size <
+                MIN_AUDIO_SIZE
+            ) {
+
+                console.log(
+                    "Audio too small. Discarding."
+                );
+
+
+                chunks = [];
+
+                recorder = null;
+
+                state = "LISTENING";
+
+                status.innerText =
+                    "🎤 Listening...";
+
+                return;
+
+            }
+
+
+            /*
+                We now have a real recording.
+
+                Stop listening while backend
+                processes it.
+            */
+
+            state = "PROCESSING";
+
+
+            status.innerText =
+                "⏳ Processing...";
+
+
+            /*
+                Prepare request.
+            */
 
             const formData =
                 new FormData();
@@ -307,6 +753,11 @@ function startRecording() {
 
             try {
 
+                console.log(
+                    "Sending audio to backend..."
+                );
+
+
                 const response =
                     await fetch(
                         "/voice",
@@ -317,32 +768,62 @@ function startRecording() {
                     );
 
 
+                if (!response.ok) {
+
+                    throw new Error(
+                        "Backend returned " +
+                        response.status
+                    );
+
+                }
+
+
                 const data =
                     await response.json();
 
 
                 /*
-                    USER TEXT
+                    If Whisper didn't hear anything,
+                    don't display an empty user message.
                 */
 
-                chat.innerHTML += `
-                    <div class="user">
-                        <b>You:</b>
-                        ${data.user_text || ""}
-                    </div>
-                `;
+                if (
+                    data.user_text &&
+                    data.user_text.trim()
+                ) {
+
+                    chat.innerHTML += `
+                        <div class="user">
+                            <b>You:</b>
+                            ${escapeHtml(
+                                data.user_text
+                            )}
+                        </div>
+                    `;
+
+                }
 
 
                 /*
-                    AI RESPONSE
+                    Display AI response only if
+                    one exists.
                 */
 
-                chat.innerHTML += `
-                    <div class="ai">
-                        <b>AI:</b>
-                        ${data.response || ""}
-                    </div>
-                `;
+                if (
+                    data.response &&
+                    data.response.trim()
+                ) {
+
+                    chat.innerHTML += `
+                        <div class="ai">
+                            <b>AI:</b>
+                            ${escapeHtml(
+                                data.response
+                            )}
+                        </div>
+                    `;
+
+                }
 
 
                 chat.scrollTop =
@@ -350,12 +831,18 @@ function startRecording() {
 
 
                 /*
-                    PLAY AI VOICE
+                    Play AI response.
                 */
 
                 if (data.audio) {
 
-                    const audio =
+                    state = "SPEAKING";
+
+                    status.innerText =
+                        "🔊 AI speaking...";
+
+
+                    currentAudio =
                         new Audio(
                             data.audio +
                             "?t=" +
@@ -363,18 +850,111 @@ function startRecording() {
                         );
 
 
-                    await audio.play();
+                    /*
+                        AI finished speaking.
+                    */
+
+                    currentAudio.onended =
+                        function () {
+
+                            currentAudio = null;
+
+                            if (agentRunning) {
+
+                                state =
+                                    "LISTENING";
+
+                                status.innerText =
+                                    "🎤 Listening...";
+
+                            }
+
+                        };
+
+
+                    /*
+                        Handle playback error.
+                    */
+
+                    currentAudio.onerror =
+                        function (error) {
+
+                            console.error(
+                                "Audio playback error:",
+                                error
+                            );
+
+
+                            currentAudio = null;
+
+
+                            if (agentRunning) {
+
+                                state =
+                                    "LISTENING";
+
+                                status.innerText =
+                                    "🎤 Listening...";
+
+                            }
+
+                        };
+
+
+                    /*
+                        Start playback.
+                    */
+
+                    currentAudio.play()
+                        .catch(
+                            function (error) {
+
+                                console.error(
+                                    "Audio play error:",
+                                    error
+                                );
+
+
+                                currentAudio = null;
+
+
+                                if (agentRunning) {
+
+                                    state =
+                                        "LISTENING";
+
+                                    status.innerText =
+                                        "🎤 Listening...";
+
+                                }
+
+                            }
+                        );
+
+                }
+
+                else {
+
+                    /*
+                        No audio response.
+                    */
+
+                    state = "LISTENING";
+
+                    status.innerText =
+                        "🎤 Listening...";
 
                 }
 
 
-                status.innerText =
-                    "🎤 Listening...";
-
-
             } catch (error) {
 
-                console.error(error);
+                console.error(
+                    error
+                );
+
+
+                state = "LISTENING";
 
                 status.innerText =
                     "❌ Error processing voice";
@@ -382,39 +962,47 @@ function startRecording() {
             }
 
 
+            /*
+                Clean up.
+            */
+
             chunks = [];
 
             recorder = null;
 
             silenceStart = null;
 
-
-            /*
-                Start listening for
-                the next sentence.
-            */
-
-            if (agentRunning) {
-
-                requestAnimationFrame(
-                    monitorAudio
-                );
-
-            }
+            speechCandidateStart = null;
 
         };
 
 
-    recorder.start();
+    /*
+        Change state BEFORE starting recorder.
+    */
 
-    recording = true;
+    state = "RECORDING";
+
+
+    status.innerText =
+        "🎤 Recording...";
+
+
+    /*
+        Start recording.
+
+        100 ms timeslice means the browser
+        periodically provides audio chunks.
+    */
+
+    recorder.start(100);
 
 }
 
 
-/*
-    STOP CURRENT SENTENCE
-*/
+/* =========================================================
+   STOP CURRENT RECORDING
+   ========================================================= */
 
 function stopRecording() {
 
@@ -423,6 +1011,11 @@ function stopRecording() {
         recorder.state === "recording"
     ) {
 
+        console.log(
+            "Stopping recording..."
+        );
+
+
         recorder.stop();
 
     }
@@ -430,14 +1023,55 @@ function stopRecording() {
 }
 
 
-/*
-    STOP WHOLE VOICE AGENT
-*/
+/* =========================================================
+   STOP WHOLE VOICE AGENT
+   ========================================================= */
 
 function stopAgent() {
 
+    console.log(
+        "Stopping voice agent..."
+    );
+
+
     agentRunning = false;
 
+    state = "STOPPED";
+
+
+    /*
+        Cancel monitoring loop.
+    */
+
+    if (animationFrameId !== null) {
+
+        cancelAnimationFrame(
+            animationFrameId
+        );
+
+        animationFrameId = null;
+
+    }
+
+
+    /*
+        Stop current AI audio.
+    */
+
+    if (currentAudio) {
+
+        currentAudio.pause();
+
+        currentAudio.currentTime = 0;
+
+        currentAudio = null;
+
+    }
+
+
+    /*
+        Stop recorder.
+    */
 
     if (
         recorder &&
@@ -448,6 +1082,10 @@ function stopAgent() {
 
     }
 
+
+    /*
+        Stop microphone.
+    */
 
     if (stream) {
 
@@ -460,6 +1098,10 @@ function stopAgent() {
     }
 
 
+    /*
+        Close audio context.
+    */
+
     if (audioContext) {
 
         audioContext.close();
@@ -467,11 +1109,23 @@ function stopAgent() {
     }
 
 
+    /*
+        Reset variables.
+    */
+
     stream = null;
 
     recorder = null;
 
+    chunks = [];
+
     recording = false;
+
+    silenceStart = null;
+
+    speechCandidateStart = null;
+
+    recordingStartTime = null;
 
 
     button.innerText =
@@ -480,6 +1134,22 @@ function stopAgent() {
 
     status.innerText =
         "Voice agent stopped.";
+
+}
+
+
+/* =========================================================
+   HTML ESCAPING
+   ========================================================= */
+
+function escapeHtml(text) {
+
+    const div =
+        document.createElement("div");
+
+    div.textContent = text;
+
+    return div.innerHTML;
 
 }
 
