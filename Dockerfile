@@ -6,6 +6,9 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Download Piper voice model
+RUN python -m piper.download_voices en_US-lessac-medium
+
 COPY . .
 
 EXPOSE 8000
