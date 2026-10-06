@@ -1,7 +1,6 @@
 import time
 import os
 import wave
-import requests
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse
@@ -10,58 +9,32 @@ from pydantic import BaseModel
 from faster_whisper import WhisperModel
 from piper import PiperVoice
 
+# IMPORTANT:
+# RAG + Ollama are handled only by rag.py
+from rag import HybridRetriever, ask_ollama
+
+
+# ============================================================
+# APP
+# ============================================================
 
 app = FastAPI()
 
 
 # ============================================================
-# Configuration
+# CONFIGURATION
 # ============================================================
 
 WHISPER_MODEL = "distil-small.en"
 
-# Piper
 PIPER_MODEL = "en_US-lessac-medium.onnx"
 
-# Audio files
 INPUT_AUDIO = "audio/browser_input.webm"
 OUTPUT_AUDIO = "audio/browser_response.wav"
 
-# Local Ollama
-OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "qwen2.5:0.5b"
-
 
 # ============================================================
-# Conversation History
-# ============================================================
-
-# Stored only in RAM.
-#
-# Server starts  -> empty conversation
-# During runtime -> conversation is remembered
-# Server stops   -> history disappears
-
-history = []
-
-
-# ============================================================
-# System Prompt
-# ============================================================
-
-SYSTEM_PROMPT = (
-    "You are a customer support voice assistant."
-    "Give short, direct, conversational answers."
-    "Answer in 1-2 sentences."
-    "Keep every response under 35 words until the user asks for more details."
-    "Do not provide lists unless the user asks."
-    "Do not repeat information."
-    "Always finish your sentence."
-)
-
-
-# ============================================================
-# Load Whisper
+# LOAD WHISPER
 # ============================================================
 
 print("Loading Whisper...")
@@ -76,7 +49,7 @@ print("Whisper loaded.")
 
 
 # ============================================================
-# Load Piper
+# LOAD PIPER
 # ============================================================
 
 print("Loading Piper...")
@@ -96,7 +69,27 @@ print(
 
 
 # ============================================================
-# Request Model
+# LOAD RAG
+# ============================================================
+
+print("\nLoading RAG system...")
+
+rag_start = time.time()
+
+rag_retriever = HybridRetriever()
+
+rag_load_time = time.time() - rag_start
+
+print(
+    f"RAG system loaded in "
+    f"{rag_load_time:.2f} seconds."
+)
+
+print("RAG ready.")
+
+
+# ============================================================
+# REQUEST MODEL
 # ============================================================
 
 class ChatRequest(BaseModel):
@@ -104,7 +97,7 @@ class ChatRequest(BaseModel):
 
 
 # ============================================================
-# Home Page
+# HOME PAGE
 # ============================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -120,81 +113,131 @@ def home():
 
 
 # ============================================================
-# Ollama
+# RAG
 # ============================================================
 
-def ask_ollama(user_message):
+def retrieve_context(user_message):
 
-    global history
+    print("\nSearching knowledge base...")
 
-    # Add user message
-    history.append({
-        "role": "user",
-        "content": user_message
-    })
-
-    # Keep only recent messages
-    recent_history = history[-4:]
-
-    print("\nAsking Ollama...")
-
-    response = requests.post(
-        OLLAMA_URL,
-
-        json={
-            "model": OLLAMA_MODEL,
-
-            "messages": [
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT
-                },
-                *recent_history
-            ],
-
-            "stream": False,
-
-            "options": {
-                "num_predict": 60
-            }
-        },
-
-        timeout=120
+    results = rag_retriever.search(
+        user_message
     )
 
-    response.raise_for_status()
+    if not results:
 
-    data = response.json()
+        print(
+            "No sufficiently relevant information found."
+        )
 
-    ai_response = data["message"]["content"].strip()
+        return None
 
-    # Save AI response
-    history.append({
-        "role": "assistant",
-        "content": ai_response
-    })
+    print("\nRetrieved Context:")
 
-    return ai_response
+    context_parts = []
+
+    for result in results:
+
+        print(
+            f"\nRerank Score: "
+            f"{result['rerank_score']:.4f}"
+        )
+
+        print(
+            f"Source: "
+            f"{result['source']}"
+        )
+
+        print(
+            result["text"]
+        )
+
+        context_parts.append(
+            result["text"]
+        )
+
+    context = "\n\n".join(
+        context_parts
+    )
+
+    return context
 
 
 # ============================================================
-# Text Chat
+# TEXT CHAT
 # ============================================================
 
 @app.post("/chat")
 def chat(request: ChatRequest):
 
     print("\n" + "=" * 50)
-
+    print("TEXT CHAT")
     print("USER:")
     print(request.message)
 
-    ai_response = ask_ollama(
+    # --------------------------------------------------------
+    # RAG Retrieval
+    # --------------------------------------------------------
+
+    rag_start = time.time()
+
+    context = retrieve_context(
         request.message
     )
 
+    rag_time = time.time() - rag_start
+
+    # --------------------------------------------------------
+    # No Relevant Knowledge
+    # --------------------------------------------------------
+
+    if context is None:
+
+        ai_response = (
+            "I don't have that information."
+        )
+
+        print("\nAI:")
+        print(ai_response)
+
+        print(
+            f"\nRAG time: "
+            f"{rag_time:.2f} seconds"
+        )
+
+        print("=" * 50)
+
+        return {
+            "response": ai_response
+        }
+
+    # --------------------------------------------------------
+    # Ollama
+    #
+    # ask_ollama comes directly from rag.py
+    # --------------------------------------------------------
+
+    ollama_start = time.time()
+
+    ai_response = ask_ollama(
+        request.message,
+        context
+    )
+
+    ollama_time = time.time() - ollama_start
+
     print("\nAI:")
     print(ai_response)
+
+    print(
+        f"\nRAG time: "
+        f"{rag_time:.2f} seconds"
+    )
+
+    print(
+        f"Ollama time: "
+        f"{ollama_time:.2f} seconds"
+    )
 
     print("=" * 50)
 
@@ -204,24 +247,29 @@ def chat(request: ChatRequest):
 
 
 # ============================================================
-# Voice
+# VOICE
 # ============================================================
 
 @app.post("/voice")
-async def voice(file: UploadFile = File(...)):
+async def voice(
+    file: UploadFile = File(...)
+):
 
     print("\n" + "=" * 50)
     print("VOICE INPUT RECEIVED")
 
     total_start = time.time()
 
-
     # --------------------------------------------------------
     # Save Browser Audio
     # --------------------------------------------------------
 
     audio_data = await file.read()
-    print(f"Audio file size: {len(audio_data) / 1024:.2f} KB")
+
+    print(
+        f"Audio file size: "
+        f"{len(audio_data) / 1024:.2f} KB"
+    )
 
     os.makedirs(
         "audio",
@@ -233,10 +281,11 @@ async def voice(file: UploadFile = File(...)):
         "wb"
     ) as audio_file:
 
-        audio_file.write(audio_data)
+        audio_file.write(
+            audio_data
+        )
 
     print("Audio received.")
-
 
     # --------------------------------------------------------
     # Speech → Text
@@ -250,23 +299,25 @@ async def voice(file: UploadFile = File(...)):
         INPUT_AUDIO,
         language="en",
         beam_size=1,
+        best_of=1,
+        temperature=0,
         condition_on_previous_text=False,
-        vad_filter=True,
-        vad_parameters={
-            "min_silence_duration_ms": 2000,
-            "speech_pad_ms": 400
-        }
+        vad_filter=False
     )
 
     user_text = ""
 
     for segment in segments:
 
-        user_text += segment.text + " "
+        user_text += (
+            segment.text + " "
+        )
 
     user_text = user_text.strip()
 
-    whisper_time = time.time() - whisper_start
+    whisper_time = (
+        time.time() - whisper_start
+    )
 
     print("\nUSER:")
     print(user_text)
@@ -275,7 +326,6 @@ async def voice(file: UploadFile = File(...)):
         f"\nWhisper time: "
         f"{whisper_time:.2f} seconds"
     )
-
 
     # --------------------------------------------------------
     # No Speech Detected
@@ -289,18 +339,113 @@ async def voice(file: UploadFile = File(...)):
             "audio": None
         }
 
+    # --------------------------------------------------------
+    # RAG Retrieval
+    # --------------------------------------------------------
+
+    rag_start = time.time()
+
+    context = retrieve_context(
+        user_text
+    )
+
+    rag_time = (
+        time.time() - rag_start
+    )
+
+    # --------------------------------------------------------
+    # No Relevant Information
+    # --------------------------------------------------------
+
+    if context is None:
+
+        ai_response = (
+            "I don't have that information."
+        )
+
+        print("\nAI:")
+        print(ai_response)
+
+        # ----------------------------------------------------
+        # Text → Speech
+        # ----------------------------------------------------
+
+        piper_start = time.time()
+
+        print("\nGenerating voice...")
+
+        with wave.open(
+            OUTPUT_AUDIO,
+            "wb"
+        ) as wav_file:
+
+            piper_voice.synthesize_wav(
+                ai_response,
+                wav_file
+            )
+
+        piper_time = (
+            time.time() - piper_start
+        )
+
+        print("Voice generated.")
+
+        print(
+            f"Piper generation time: "
+            f"{piper_time:.2f} seconds"
+        )
+
+        total_time = (
+            time.time() - total_start
+        )
+
+        print("\n" + "-" * 50)
+
+        print(
+            f"Whisper : "
+            f"{whisper_time:.2f}s"
+        )
+
+        print(
+            f"RAG     : "
+            f"{rag_time:.2f}s"
+        )
+
+        print(
+            f"Piper   : "
+            f"{piper_time:.2f}s"
+        )
+
+        print(
+            f"TOTAL   : "
+            f"{total_time:.2f}s"
+        )
+
+        print("-" * 50)
+        print("=" * 50)
+
+        return {
+            "user_text": user_text,
+            "response": ai_response,
+            "audio": "/voice-response"
+        }
 
     # --------------------------------------------------------
     # Ollama
+    #
+    # ask_ollama comes directly from rag.py
     # --------------------------------------------------------
 
     ollama_start = time.time()
 
     ai_response = ask_ollama(
-        user_text
+        user_text,
+        context
     )
 
-    ollama_time = time.time() - ollama_start
+    ollama_time = (
+        time.time() - ollama_start
+    )
 
     print("\nAI:")
     print(ai_response)
@@ -310,7 +455,6 @@ async def voice(file: UploadFile = File(...)):
         f"{ollama_time:.2f} seconds"
     )
 
-
     # --------------------------------------------------------
     # Text → Speech
     # --------------------------------------------------------
@@ -318,9 +462,6 @@ async def voice(file: UploadFile = File(...)):
     piper_start = time.time()
 
     print("\nGenerating voice...")
-
-    # Piper was already loaded when the server started.
-    # We reuse the same loaded model here.
 
     with wave.open(
         OUTPUT_AUDIO,
@@ -332,7 +473,9 @@ async def voice(file: UploadFile = File(...)):
             wav_file
         )
 
-    piper_time = time.time() - piper_start
+    piper_time = (
+        time.time() - piper_start
+    )
 
     print("Voice generated.")
 
@@ -341,18 +484,24 @@ async def voice(file: UploadFile = File(...)):
         f"{piper_time:.2f} seconds"
     )
 
-
     # --------------------------------------------------------
     # Total Processing Time
     # --------------------------------------------------------
 
-    total_time = time.time() - total_start
+    total_time = (
+        time.time() - total_start
+    )
 
     print("\n" + "-" * 50)
 
     print(
         f"Whisper : "
         f"{whisper_time:.2f}s"
+    )
+
+    print(
+        f"RAG     : "
+        f"{rag_time:.2f}s"
     )
 
     print(
@@ -371,9 +520,7 @@ async def voice(file: UploadFile = File(...)):
     )
 
     print("-" * 50)
-
     print("=" * 50)
-
 
     # --------------------------------------------------------
     # Return Result
@@ -387,7 +534,7 @@ async def voice(file: UploadFile = File(...)):
 
 
 # ============================================================
-# Return Generated Audio
+# RETURN GENERATED AUDIO
 # ============================================================
 
 @app.get("/voice-response")

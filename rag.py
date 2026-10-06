@@ -3,8 +3,11 @@ import re
 import faiss
 import numpy as np
 import requests
+import torch
+torch.set_num_threads(2)
+torch.set_num_interop_threads(1)
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from sentence_transformers import SentenceTransformer
 
 
 # ============================================================
@@ -75,11 +78,10 @@ def extract_loan_type(text):
     if not matches:
         return None
 
-    # Remove articles such as "a" / "the"
     topic = matches[-1].strip()
 
     topic = re.sub(
-        r"^(a|an|the)\s+",
+        r"^(from|for|our|a|an|the)\s+",
         "",
         topic
     )
@@ -227,7 +229,8 @@ class HybridRetriever:
         print("Loading embedding model...")
 
         self.embedding_model = SentenceTransformer(
-            EMBEDDING_MODEL
+           "models/huggingface/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+            local_files_only=True
         )
 
         # ----------------------------------------------------
@@ -282,14 +285,7 @@ class HybridRetriever:
         # Load reranker
         # ----------------------------------------------------
 
-        print("Loading reranker model...")
-
-        self.reranker = CrossEncoder(
-            RERANKER_MODEL
-        )
-
-        print("Reranker loaded.")
-
+    
         print("RAG system ready.")
 
     # ========================================================
@@ -492,98 +488,23 @@ class HybridRetriever:
         final_top_k=FINAL_TOP_K,
         threshold=RERANK_THRESHOLD
     ):
-
         if not candidates:
             return []
 
-        # ----------------------------------------------------
-        # Create query-document pairs
-        # ----------------------------------------------------
+        relevant_results = []
 
-        pairs = [
-            [
-                query,
-                candidate["text"]
-            ]
-            for candidate in candidates
-        ]
+        for candidate in candidates:
+            if self.is_topic_consistent(query, candidate):
+                result = candidate.copy()
+                result["rerank_score"] = result["hybrid_score"]
+                relevant_results.append(result)
 
-        # ----------------------------------------------------
-        # CrossEncoder scores
-        # ----------------------------------------------------
-
-        raw_scores = self.reranker.predict(
-            pairs
-        )
-
-        raw_scores = np.asarray(
-            raw_scores
-        )
-
-        # Convert logits to probability-like
-        # values for easier thresholding.
-        rerank_scores = (
-            1 /
-            (
-                1 +
-                np.exp(-raw_scores)
-            )
-        )
-
-        # ----------------------------------------------------
-        # Attach reranker scores
-        # ----------------------------------------------------
-
-        results = []
-
-        for candidate, score in zip(
-            candidates,
-            rerank_scores
-        ):
-
-            result = candidate.copy()
-
-            result["rerank_score"] = float(
-                score
-            )
-
-            results.append(result)
-
-        # ----------------------------------------------------
-        # Sort by reranker score
-        # ----------------------------------------------------
-
-        results.sort(
-            key=lambda x: x["rerank_score"],
+        relevant_results.sort(
+            key=lambda x: x["hybrid_score"],
             reverse=True
         )
 
-        # ----------------------------------------------------
-        # Relevance gate
-        #
-        # BOTH conditions must be true:
-        #
-        # 1. Reranker score is high enough.
-        # 2. Loan type is consistent.
-        # ----------------------------------------------------
-
-        relevant_results = [
-            result
-            for result in results
-            if (
-                result["rerank_score"]
-                >= threshold
-                and
-                self.is_topic_consistent(
-                    query,
-                    result
-                )
-            )
-        ]
-
-        return relevant_results[
-            :final_top_k
-        ]
+        return relevant_results[:final_top_k]
 
     # ========================================================
     # COMPLETE SEARCH
