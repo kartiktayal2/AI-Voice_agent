@@ -18,7 +18,7 @@ app = FastAPI()
 # Configuration
 # ============================================================
 
-WHISPER_MODEL = "distil-small.en"
+WHISPER_MODEL = "tiny.en"  # or "distil-small.en" for better accuracy
 
 # Piper
 PIPER_MODEL = "en_US-lessac-medium.onnx"
@@ -28,7 +28,7 @@ INPUT_AUDIO = "audio/browser_input.webm"
 OUTPUT_AUDIO = "audio/browser_response.wav"
 
 # Local Ollama
-OLLAMA_URL = "http://ollama.railway.internal:11434/api/chat"
+OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "qwen2.5:0.5b"
 
 
@@ -50,13 +50,14 @@ history = []
 # ============================================================
 
 SYSTEM_PROMPT = (
-    "You are a customer support voice assistant."
-    "Give short, direct, conversational answers."
-    "Answer in 1-2 sentences."
-    "Keep every response under 35 words until the user asks for more details."
-    "Do not provide lists unless the user asks."
-    "Do not repeat information."
-    "Always finish your sentence."
+    "You are a customer support voice assistant. "
+    "Give concise, natural, conversational answers. "
+    "For simple questions, answer in 1-2 sentences. "
+    "For complex questions, answer in a few short sentences covering the main points. "
+    "Do not exceed 60 words unless the user explicitly asks for more detail. "
+    "Do not provide lists unless the user asks. "
+    "Do not repeat information. "
+    "Always finish your answer."
 )
 
 
@@ -155,7 +156,7 @@ def ask_ollama(user_message):
             "stream": False,
 
             "options": {
-                "num_predict": 60
+                "num_predict": 50
             }
         },
 
