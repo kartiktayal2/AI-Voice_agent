@@ -25,7 +25,7 @@ app = FastAPI()
 # CONFIGURATION
 # ============================================================
 
-WHISPER_MODEL = "tiny.en"
+WHISPER_MODEL = "distil-small.en"
 
 PIPER_MODEL = "en_US-lessac-medium.onnx"
 

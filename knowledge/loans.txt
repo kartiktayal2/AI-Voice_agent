@@ -1,36 +1,323 @@
-Personal Loan
+# Sample Bank — Personal Loan Knowledge Base
+
+## 1. Personal Loan Overview
+
+A personal loan is a loan that an eligible applicant can apply for, subject to the bank's eligibility verification and approval process.
+
+The sample bank provides personal loans within the following limits:
+
+- Minimum loan amount: ₹50,000.
+- Maximum loan amount: ₹10,00,000.
+- Starting interest rate: 10.5% per annum.
+- Maximum repayment tenure: 7 years.
+- Processing fee: 1% of the approved loan amount.
+
+The actual loan amount, applicable interest rate, repayment tenure, and other terms depend on the approved loan and its applicable terms.
+
+## 2. Personal Loan Amount
 
 The personal loan amount ranges from ₹50,000 to ₹10,00,000.
 
+The minimum loan amount is ₹50,000.
+
+The maximum loan amount is ₹10,00,000.
+
+An applicant should not assume that the maximum amount will automatically be approved. Loan approval depends on eligibility verification and the bank's approval process.
+
+**Frequently Asked Questions**
+
+**Q: What is the minimum personal loan amount?**
+
+A: The minimum personal loan amount is ₹50,000.
+
+**Q: What is the maximum personal loan amount?**
+
+A: The maximum personal loan amount is ₹10,00,000.
+
+**Q: Will every applicant receive ₹10,00,000?**
+
+A: No. Loan approval is not guaranteed. The application is subject to eligibility verification and approval.
+
+## 3. Personal Loan Interest Rate
+
 The interest rate for a personal loan starts from 10.5% per annum.
+
+The starting interest rate is not necessarily the final interest rate applicable to every applicant. The exact applicable rate for an individual applicant is not specified in this sample policy.
+
+**Frequently Asked Questions**
+
+**Q: What is the starting interest rate for a personal loan?**
+
+A: The starting interest rate is 10.5% per annum.
+
+**Q: Is 10.5% the guaranteed interest rate for every applicant?**
+
+A: No. The policy specifies a starting rate of 10.5% per annum. The exact rate applicable to an individual applicant is not specified.
+
+**Q: What is the maximum personal loan interest rate?**
+
+A: The maximum interest rate is not specified in the available policy information.
+
+## 4. Personal Loan Repayment Tenure
 
 The maximum repayment tenure for a personal loan is 7 years.
 
+Customers must repay the approved loan according to the agreed repayment schedule.
+
+The exact monthly installment depends on the loan amount, interest rate, and repayment tenure.
+
+The minimum repayment tenure is not specified in the available policy information.
+
+**Frequently Asked Questions**
+
+**Q: What is the maximum repayment tenure?**
+
+A: The maximum repayment tenure is 7 years.
+
+**Q: How is the monthly installment determined?**
+
+A: The monthly installment depends on the loan amount, interest rate, and repayment tenure.
+
+**Q: What is the minimum repayment tenure?**
+
+A: The minimum repayment tenure is not specified in the available policy information.
+
+**Q: Can a customer choose any repayment tenure?**
+
+A: The available policy does not specify the complete range of available repayment tenures. The applicable tenure should be confirmed through the bank's official process.
+
+## 5. Personal Loan Processing Fee
+
 The processing fee is 1% of the approved loan amount.
 
+The fee is calculated using the approved loan amount, not automatically the maximum loan amount.
 
-Personal Loan Eligibility
+**Calculation examples**
 
-The applicant must be at least 21 years old.
+- Approved loan of ₹50,000: processing fee = ₹500.
+- Approved loan of ₹1,00,000: processing fee = ₹1,000.
+- Approved loan of ₹5,00,000: processing fee = ₹5,000.
+- Approved loan of ₹10,00,000: processing fee = ₹10,000.
 
-The applicant must have a regular source of income.
+These examples apply the stated 1% fee directly. Additional taxes, deductions, or other charges are not specified in the available policy information.
 
-The applicant must have a valid PAN card.
+**Frequently Asked Questions**
 
-The applicant must provide valid identity and address proof.
+**Q: What is the processing fee for a personal loan?**
 
+A: The processing fee is 1% of the approved loan amount.
 
-Loan Application
+**Q: What is the processing fee for a loan of ₹1,00,000?**
+
+A: The processing fee is ₹1,000, calculated at 1% of ₹1,00,000.
+
+**Q: What is the processing fee for a loan of ₹5,00,000?**
+
+A: The processing fee is ₹5,000, calculated at 1% of ₹5,00,000.
+
+**Q: What is the processing fee for a loan of ₹10,00,000?**
+
+A: The processing fee is ₹10,000, calculated at 1% of ₹10,00,000.
+
+**Q: Are taxes included in the processing fee?**
+
+A: The available policy does not specify whether taxes are included in the processing fee.
+
+## 6. Personal Loan Eligibility
+
+An applicant must meet the following stated eligibility requirements:
+
+1. The applicant must be at least 21 years old.
+2. The applicant must have a regular source of income.
+3. The applicant must have a valid PAN card.
+4. The applicant must provide valid identity proof.
+5. The applicant must provide valid address proof.
+
+Meeting these stated requirements does not guarantee loan approval. The application remains subject to eligibility verification and approval.
+
+The maximum eligible age, minimum income, employment duration, credit score requirements, and other detailed eligibility criteria are not specified in the available policy information.
+
+**Frequently Asked Questions**
+
+**Q: What is the minimum age to apply for a personal loan?**
+
+A: The applicant must be at least 21 years old.
+
+**Q: Is a regular source of income required?**
+
+A: Yes. The applicant must have a regular source of income.
+
+**Q: Is a PAN card required?**
+
+A: Yes. The applicant must have a valid PAN card.
+
+**Q: Is identity proof required?**
+
+A: Yes. The applicant must provide valid identity proof.
+
+**Q: Is address proof required?**
+
+A: Yes. The applicant must provide valid address proof.
+
+**Q: Is loan approval guaranteed if all eligibility conditions are met?**
+
+A: No. The application is subject to eligibility verification and approval.
+
+## 7. Documents Required for a Personal Loan
+
+The stated document requirements are:
+
+- Valid PAN card.
+- Valid identity proof.
+- Valid address proof.
+- Required loan application.
+- Other documents required during the bank's application and verification process, if applicable.
+
+The available policy does not specify the complete list of accepted identity documents, accepted address documents, income documents, or employment documents.
+
+Applicants should confirm the exact accepted documents through the bank's official application process rather than relying on an assumed list.
+
+**Frequently Asked Questions**
+
+**Q: Which documents are explicitly required for a personal loan?**
+
+A: The stated requirements include a valid PAN card, valid identity proof, valid address proof, and the required loan application.
+
+**Q: Is income proof specifically listed as a mandatory document?**
+
+A: A regular source of income is an eligibility requirement, but the available policy does not explicitly specify which income documents must be submitted.
+
+**Q: Are employment documents mandatory?**
+
+A: The available policy does not explicitly list employment documents as mandatory.
+
+**Q: Are bank statements required?**
+
+A: Bank statements are not specifically mentioned in the available policy information.
+
+**Q: Which identity documents are accepted?**
+
+A: The exact list of accepted identity documents is not specified in the available policy information.
+
+## 8. Personal Loan Application Process
 
 Customers can apply for a personal loan by submitting the required application and documents.
 
 The application is subject to eligibility verification and approval.
 
-Loan approval is not guaranteed and depends on the applicant's eligibility and verification.
+The general process described by the available policy is:
 
+1. Submit the personal loan application.
+2. Provide the required documents.
+3. Complete the eligibility verification process.
+4. Wait for the bank's approval decision.
 
-Loan Repayment
+The exact application channels, processing time, verification steps, and disbursement timeline are not specified in the available policy information.
+
+**Frequently Asked Questions**
+
+**Q: How can a customer apply for a personal loan?**
+
+A: Customers can apply by submitting the required application and documents.
+
+**Q: What happens after an application is submitted?**
+
+A: The application is subject to eligibility verification and approval.
+
+**Q: How long does personal loan approval take?**
+
+A: The approval timeline is not specified in the available policy information.
+
+**Q: Is loan disbursement guaranteed after submitting an application?**
+
+A: No. Loan approval is not guaranteed and depends on the applicant's eligibility and verification.
+
+## 9. Loan Approval and Verification
+
+Every personal loan application is subject to eligibility verification and approval.
+
+Submitting an application does not guarantee approval.
+
+Approval depends on the applicant's eligibility and verification.
+
+The available policy does not specify detailed rejection reasons, credit assessment criteria, approval turnaround times, or appeal procedures.
+
+**Frequently Asked Questions**
+
+**Q: Is every personal loan application approved?**
+
+A: No. Approval is not guaranteed.
+
+**Q: What determines whether an application is approved?**
+
+A: The application depends on the applicant's eligibility and verification.
+
+**Q: What are the exact reasons a loan application may be rejected?**
+
+A: The available policy does not specify the complete list of rejection reasons.
+
+## 10. Loan Repayment
 
 Customers must repay the approved loan according to the agreed repayment schedule.
 
-The exact monthly installment depends on the loan amount, interest rate, and repayment tenure.
+The exact monthly installment depends on:
+
+- The approved loan amount.
+- The applicable interest rate.
+- The repayment tenure.
+
+The available policy does not specify the exact payment dates, accepted payment methods, late-payment charges, prepayment rules, or foreclosure charges.
+
+**Frequently Asked Questions**
+
+**Q: How should customers repay their personal loan?**
+
+A: Customers must follow the agreed repayment schedule.
+
+**Q: What factors determine the monthly installment?**
+
+A: The loan amount, interest rate, and repayment tenure determine the exact monthly installment.
+
+**Q: What are the late-payment charges?**
+
+A: Late-payment charges are not specified in the available policy information.
+
+**Q: Can a customer repay the loan early?**
+
+A: The early repayment policy is not specified in the available policy information.
+
+**Q: What are the foreclosure charges?**
+
+A: Foreclosure charges are not specified in the available policy information.
+
+## 11. Questions Outside the Available Policy
+
+The knowledge base does not currently contain verified information about:
+
+- Home loans, car loans, education loans, or business loans.
+- Maximum interest rates.
+- Minimum repayment tenure.
+- Minimum monthly income.
+- Credit score requirements.
+- Accepted income documents and bank statements.
+- Exact approval and disbursement timelines.
+- Late-payment penalties.
+- Prepayment and foreclosure charges.
+- Additional taxes and fees.
+- Specific bank branches, contact numbers, or customer care details.
+
+If a customer asks about any of these topics, the voice agent should clearly state that the information is not available in the current knowledge base. It must not invent a bank policy or present general industry practices as verified facts.
+
+## 12. Grounding Rule for the AI Voice Agent
+
+The AI voice agent must answer questions using only the retrieved knowledge-base context.
+
+It must not invent fees, interest rates, eligibility criteria, document requirements, timelines, or policies.
+
+If the retrieved context does not contain the requested information, the agent should respond:
+
+"I don't have that information."
+
+If a question contains multiple parts, the agent should answer every part supported by the retrieved context and clearly identify any part for which information is unavailable.
+
+Answers should be concise, conversational, and suitable for spoken delivery.

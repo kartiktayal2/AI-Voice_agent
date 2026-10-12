@@ -1,13 +1,11 @@
 from pathlib import Path
 import re
+
 import faiss
 import numpy as np
 import requests
-import torch
-torch.set_num_threads(2)
-torch.set_num_interop_threads(1)
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
 
 # ============================================================
@@ -22,71 +20,151 @@ RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "qwen2.5:0.5b"
 
-RETRIEVAL_TOP_K = 5
-FINAL_TOP_K = 3
+# Retrieve broadly first; let the cross-encoder rank the union.
+RETRIEVAL_TOP_K = 12
+FINAL_TOP_K = 5
 
-RERANK_THRESHOLD = 0.50
+# This is a sigmoid-transformed cross-encoder score, NOT a calibrated
+# probability. A lower gate avoids rejecting borderline relevant chunks.
+RERANK_THRESHOLD = 0.35
 
 
 # ============================================================
-# GENERIC LOAN TYPE EXTRACTION
+# TEXT / CHUNKING HELPERS
 # ============================================================
 
-def extract_loan_type(text):
+def _tokenize(text):
+    """Tokenize words and numbers consistently for BM25."""
+    return re.findall(r"[a-z]+(?:'[a-z]+)?|\d+(?:[.,]\d+)*|₹|%", text.lower())
+
+
+def _is_heading(line):
+    """Recognize actual section headings without treating every short line as one."""
+    line = line.strip()
+    if not line:
+        return False
+
+    if re.match(r"^#{1,6}\s+", line):
+        return True
+    if re.match(r"^\*\*[^*]{2,100}\*\*$", line):
+        inner = line[2:-2].strip()
+        if not inner.lower().startswith(("q:", "a:")) and "?" not in inner:
+            return True
+
+    numbered_heading = re.match(r"^(?:\d+(?:\.\d+)*[.)]?\s+).{2,100}$", line)
+    if numbered_heading and not line.rstrip().endswith((".", "?", "!")):
+        return True
+
+    # Plain-text headings such as "Personal Loan" or "Loan Repayment".
+    # Do not treat questions, answers, or sentence-like lines as headings.
+    if (
+        len(line.split()) <= 7
+        and not re.match(r"^(?:q|a)\s*:", line, flags=re.I)
+        and not any(mark in line for mark in ("?", "!", ".", ";"))
+        and not re.match(r"^[\-*]\s+", line)
+    ):
+        return True
+
+    return False
+
+
+def chunk_text(text, max_words=120):
     """
-    Extract the loan type from the first line of a chunk
-    or from the user's question.
-
-    Examples:
-
-    Personal Loan
-    The personal loan amount ranges...
-
-    -> personal
-
-    What is the interest rate for a personal loan?
-    -> personal
+    Build heading-aware chunks while keeping paragraphs and FAQ answers together.
+    Headings are repeated in each chunk from their section for retrieval context.
     """
+    paragraphs = [
+        part.strip()
+        for part in re.split(r"\n\s*\n", text)
+        if part.strip()
+    ]
 
-    text = text.lower().strip()
+    sections = []
+    current_heading = ""
+    current_paragraphs = []
 
-    # --------------------------------------------------------
-    # If this is a chunk, use its first line.
-    # --------------------------------------------------------
+    def flush_section():
+        nonlocal current_heading, current_paragraphs
+        if current_heading or current_paragraphs:
+            sections.append((current_heading, current_paragraphs[:]))
+        current_paragraphs = []
 
-    first_line = text.splitlines()[0].strip()
+    for paragraph in paragraphs:
+        lines = paragraph.splitlines()
+        first_line = lines[0].strip()
 
-    # Example:
-    # "Personal Loan" -> "personal"
-    heading_match = re.fullmatch(
-        r"([a-z]+(?:\s+[a-z]+)?)\s+loan",
-        first_line
-    )
+        if _is_heading(first_line):
+            flush_section()
+            current_heading = first_line
+            remainder = "\n".join(lines[1:]).strip()
+            if remainder:
+                current_paragraphs.append(remainder)
+        else:
+            # If a heading wasn't detected, preserve the paragraph as content.
+            current_paragraphs.append(paragraph)
 
-    if heading_match:
-        return heading_match.group(1).strip()
+    flush_section()
 
-    # --------------------------------------------------------
-    # Otherwise search the query.
-    # --------------------------------------------------------
+    chunks = []
 
-    matches = re.findall(
-        r"\b([a-z]+(?:\s+[a-z]+)?)\s+loan\b",
-        text
-    )
+    for heading, section_paragraphs in sections:
+        prefix = heading.strip()
+        content_parts = []
+        current_count = len(_tokenize(prefix)) if prefix else 0
 
-    if not matches:
-        return None
+        def emit():
+            nonlocal content_parts, current_count
+            if not content_parts:
+                return
+            body = "\n".join(content_parts).strip()
+            chunk = f"{prefix}\n{body}".strip() if prefix else body
+            if chunk:
+                chunks.append(chunk)
+            content_parts = []
+            current_count = len(_tokenize(prefix)) if prefix else 0
 
-    topic = matches[-1].strip()
+        for paragraph in section_paragraphs:
+            paragraph_words = _tokenize(paragraph)
 
-    topic = re.sub(
-        r"^(from|for|our|a|an|the)\s+",
-        "",
-        topic
-    )
+            # Split only an unusually long paragraph, preferably at sentence boundaries.
+            pieces = [paragraph]
+            if len(paragraph_words) > max_words:
+                sentences = re.split(r"(?<=[.!?])\s+", paragraph.strip())
+                pieces = []
+                sentence_group = []
+                sentence_count = 0
 
-    return topic
+                for sentence in sentences:
+                    sentence_size = len(_tokenize(sentence))
+                    if sentence_group and sentence_count + sentence_size > max_words:
+                        pieces.append(" ".join(sentence_group))
+                        sentence_group = []
+                        sentence_count = 0
+                    if sentence_size > max_words:
+                        if sentence_group:
+                            pieces.append(" ".join(sentence_group))
+                            sentence_group = []
+                            sentence_count = 0
+                        words = sentence.split()
+                        for start in range(0, len(words), max_words):
+                            pieces.append(" ".join(words[start:start + max_words]))
+                    else:
+                        sentence_group.append(sentence)
+                        sentence_count += sentence_size
+
+                if sentence_group:
+                    pieces.append(" ".join(sentence_group))
+
+            for piece in pieces:
+                piece_count = len(_tokenize(piece))
+                if content_parts and current_count + piece_count > max_words:
+                    emit()
+                content_parts.append(piece.strip())
+                current_count += piece_count
+
+        emit()
+
+    return [chunk for chunk in chunks if chunk.strip()]
 
 
 # ============================================================
@@ -95,96 +173,24 @@ def extract_loan_type(text):
 
 def load_documents():
     documents = []
-
     print("Loading documents...")
 
-    for file_path in KNOWLEDGE_DIR.glob("*.txt"):
-        text = file_path.read_text(encoding="utf-8")
-
-        documents.append({
-            "source": file_path.name,
-            "text": text
-        })
-
-    return documents
-
-
-# ============================================================
-# HYBRID CHUNKING
-# ============================================================
-
-def chunk_text(text, max_words=120):
-    """
-    Hybrid chunking:
-
-    1. Uses headings/sections to preserve meaning.
-    2. Splits large sections by word count.
-    """
-
-    sections = []
-
-    raw_sections = text.split("\n\n")
-
-    current_section = ""
-
-    for block in raw_sections:
-
-        block = block.strip()
-
-        if not block:
-            continue
-
-        # Treat short blocks as possible headings.
-        if len(block.split()) <= 5:
-
-            if current_section:
-                sections.append(
-                    current_section.strip()
-                )
-
-            current_section = block
-
-        else:
-
-            if current_section:
-                current_section += "\n" + block
-            else:
-                current_section = block
-
-    if current_section:
-        sections.append(
-            current_section.strip()
+    if not KNOWLEDGE_DIR.exists():
+        raise FileNotFoundError(
+            f"Knowledge directory not found: {KNOWLEDGE_DIR.resolve()}"
         )
 
-    # --------------------------------------------------------
-    # Split large sections
-    # --------------------------------------------------------
+    for file_path in sorted(KNOWLEDGE_DIR.glob("*.txt")):
+        text = file_path.read_text(encoding="utf-8").strip()
+        if text:
+            documents.append({"source": file_path.name, "text": text})
 
-    final_chunks = []
+    if not documents:
+        raise FileNotFoundError(
+            f"No non-empty .txt knowledge files found in {KNOWLEDGE_DIR.resolve()}"
+        )
 
-    for section in sections:
-
-        words = section.split()
-
-        if len(words) <= max_words:
-
-            final_chunks.append(section)
-
-        else:
-
-            for i in range(
-                0,
-                len(words),
-                max_words
-            ):
-
-                chunk = " ".join(
-                    words[i:i + max_words]
-                )
-
-                final_chunks.append(chunk)
-
-    return final_chunks
+    return documents
 
 
 # ============================================================
@@ -192,511 +198,196 @@ def chunk_text(text, max_words=120):
 # ============================================================
 
 class HybridRetriever:
-
     def __init__(self):
-
         print("Loading RAG system...")
 
-        # ----------------------------------------------------
-        # Load documents
-        # ----------------------------------------------------
-
         documents = load_documents()
-
         self.chunks = []
 
         for document in documents:
-
-            chunks = chunk_text(
-                document["text"]
-            )
-
-            for chunk in chunks:
-
+            for chunk in chunk_text(document["text"]):
                 self.chunks.append({
                     "source": document["source"],
-                    "text": chunk
+                    "text": chunk,
                 })
 
-        print(
-            f"Total chunks: {len(self.chunks)}"
-        )
+        if not self.chunks:
+            raise ValueError("The knowledge files did not produce any searchable chunks.")
 
-        # ----------------------------------------------------
-        # Load embedding model
-        # ----------------------------------------------------
+        print(f"Total chunks: {len(self.chunks)}")
 
         print("Loading embedding model...")
+        self.embedding_model = SentenceTransformer(EMBEDDING_MODEL)
 
-        self.embedding_model = SentenceTransformer(
-           "models/huggingface/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
-            local_files_only=True
-        )
-
-        # ----------------------------------------------------
-        # Create embeddings
-        # ----------------------------------------------------
-
-        texts = [
-            chunk["text"]
-            for chunk in self.chunks
-        ]
-
+        texts = [chunk["text"] for chunk in self.chunks]
         embeddings = self.embedding_model.encode(
             texts,
             convert_to_numpy=True,
-            normalize_embeddings=True
-        )
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).astype("float32")
 
-        embeddings = embeddings.astype(
-            "float32"
-        )
-
-        # ----------------------------------------------------
-        # FAISS
-        # ----------------------------------------------------
-
-        self.faiss_index = faiss.IndexFlatIP(
-            embeddings.shape[1]
-        )
-
-        self.faiss_index.add(
-            embeddings
-        )
-
+        self.faiss_index = faiss.IndexFlatIP(embeddings.shape[1])
+        self.faiss_index.add(embeddings)
         print("FAISS index created.")
 
-        # ----------------------------------------------------
-        # BM25
-        # ----------------------------------------------------
-
-        tokenized_documents = [
-            text.lower().split()
-            for text in texts
-        ]
-
-        self.bm25 = BM25Okapi(
-            tokenized_documents
-        )
-
+        self.bm25 = BM25Okapi([_tokenize(text) for text in texts])
         print("BM25 index created.")
 
-        # ----------------------------------------------------
-        # Load reranker
-        # ----------------------------------------------------
-
-    
+        print("Loading reranker model...")
+        self.reranker = CrossEncoder(RERANKER_MODEL)
+        print("Reranker loaded.")
         print("RAG system ready.")
 
-    # ========================================================
-    # HYBRID RETRIEVAL
-    # ========================================================
-
-    def retrieve_candidates(
-        self,
-        query,
-        top_k=RETRIEVAL_TOP_K
-    ):
-
-        # ----------------------------------------------------
-        # Vector search
-        # ----------------------------------------------------
+    def retrieve_candidates(self, query, top_k=RETRIEVAL_TOP_K):
+        """Return the union of vector and lexical candidates; don't truncate the union."""
+        count = len(self.chunks)
+        k = min(top_k, count)
 
         query_embedding = self.embedding_model.encode(
             [query],
             convert_to_numpy=True,
-            normalize_embeddings=True
-        )
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).astype("float32")
 
-        query_embedding = query_embedding.astype(
-            "float32"
-        )
-
-        vector_scores, vector_indices = (
-            self.faiss_index.search(
-                query_embedding,
-                min(
-                    top_k,
-                    len(self.chunks)
-                )
-            )
-        )
-
+        vector_scores, vector_indices = self.faiss_index.search(query_embedding, k)
         vector_scores = vector_scores[0]
         vector_indices = vector_indices[0]
 
-        # ----------------------------------------------------
-        # BM25 search
-        # ----------------------------------------------------
+        bm25_scores = np.asarray(self.bm25.get_scores(_tokenize(query)), dtype="float32")
+        bm25_top_indices = np.argsort(bm25_scores)[::-1][:k]
 
-        tokenized_query = query.lower().split()
+        max_bm25 = float(bm25_scores.max()) if bm25_scores.size else 0.0
+        normalized_bm25 = bm25_scores / max_bm25 if max_bm25 > 0 else np.zeros_like(bm25_scores)
 
-        bm25_scores = self.bm25.get_scores(
-            tokenized_query
-        )
+        vector_score_by_index = {
+            int(index): float(score)
+            for score, index in zip(vector_scores, vector_indices)
+            if int(index) >= 0
+        }
 
-        bm25_top_indices = np.argsort(
-            bm25_scores
-        )[::-1][
-            :min(
-                top_k,
-                len(self.chunks)
-            )
-        ]
-
-        # ----------------------------------------------------
-        # Normalize BM25 scores
-        # ----------------------------------------------------
-
-        max_bm25 = np.max(
-            bm25_scores
-        )
-
-        if max_bm25 > 0:
-
-            normalized_bm25 = (
-                bm25_scores / max_bm25
-            )
-
-        else:
-
-            normalized_bm25 = np.zeros_like(
-                bm25_scores
-            )
-
-        # ----------------------------------------------------
-        # Combine FAISS + BM25 candidates
-        # ----------------------------------------------------
-
-        candidate_indices = set(
-            vector_indices.tolist()
-        )
-
-        candidate_indices.update(
-            bm25_top_indices.tolist()
-        )
+        candidate_indices = set(vector_score_by_index)
+        candidate_indices.update(int(index) for index in bm25_top_indices)
 
         candidates = []
-
         for index in candidate_indices:
-
-            vector_score = 0.0
-
-            if index in vector_indices:
-
-                position = np.where(
-                    vector_indices == index
-                )[0][0]
-
-                vector_score = float(
-                    vector_scores[position]
-                )
-
-            bm25_score = float(
-                normalized_bm25[index]
-            )
-
-            hybrid_score = (
-                0.6 * vector_score
-                +
-                0.4 * bm25_score
-            )
+            vector_score = vector_score_by_index.get(index, 0.0)
+            bm25_score = float(normalized_bm25[index])
+            hybrid_score = 0.6 * vector_score + 0.4 * bm25_score
 
             candidates.append({
-                "index": int(index),
+                "index": index,
                 "source": self.chunks[index]["source"],
                 "text": self.chunks[index]["text"],
                 "vector_score": vector_score,
                 "bm25_score": bm25_score,
-                "hybrid_score": hybrid_score
+                "hybrid_score": hybrid_score,
             })
 
-        # ----------------------------------------------------
-        # Sort by hybrid score
-        # ----------------------------------------------------
-
-        candidates.sort(
-            key=lambda x: x["hybrid_score"],
-            reverse=True
-        )
-
-        return candidates[:top_k]
-
-    # ========================================================
-    # TOPIC CONSISTENCY CHECK
-    # ========================================================
-
-    def is_topic_consistent(
-        self,
-        query,
-        result
-    ):
-        """
-        Prevent information from one loan type
-        being used for another loan type.
-
-        This is dynamic.
-
-        It does NOT contain hardcoded rules such as:
-            if "home loan"
-            if "car loan"
-
-        Instead it extracts the loan type from:
-            - the user query
-            - the retrieved chunk
-        """
-
-        query_loan_type = extract_loan_type(
-            query
-        )
-
-        chunk_loan_type = extract_loan_type(
-            result["text"]
-        )
-
+        candidates.sort(key=lambda item: item["hybrid_score"], reverse=True)
         print(
-            f"DEBUG | Query topic: "
-            f"{query_loan_type} | "
-            f"Chunk topic: "
-            f"{chunk_loan_type}"
+            f"RETRIEVAL DEBUG | vector candidates={len(vector_score_by_index)} "
+            f"| BM25 candidates={len(bm25_top_indices)} "
+            f"| unique candidates={len(candidates)}"
         )
+        return candidates
 
-        # If the query does not explicitly
-        # mention a loan type, don't reject it.
-        if query_loan_type is None:
-            return True
-
-        # If the chunk does not contain
-        # a detectable loan type, don't reject it.
-        if chunk_loan_type is None:
-            return True
-
-        # Only allow matching loan types.
-        return (
-            query_loan_type
-            == chunk_loan_type
-        )
-
-    # ========================================================
-    # RERANK
-    # ========================================================
-
-    def rerank(
-        self,
-        query,
-        candidates,
-        final_top_k=FINAL_TOP_K,
-        threshold=RERANK_THRESHOLD
-    ):
+    def rerank(self, query, candidates, final_top_k=FINAL_TOP_K, threshold=RERANK_THRESHOLD):
         if not candidates:
             return []
 
-        relevant_results = []
+        pairs = [[query, candidate["text"]] for candidate in candidates]
+        raw_scores = np.asarray(self.reranker.predict(pairs), dtype="float32").reshape(-1)
 
-        for candidate in candidates:
-            if self.is_topic_consistent(query, candidate):
-                result = candidate.copy()
-                result["rerank_score"] = result["hybrid_score"]
-                relevant_results.append(result)
+        # CrossEncoder logits are not calibrated probabilities. Sigmoid is retained
+        # only as a monotonic score transform for compatibility with existing logs.
+        safe_scores = np.clip(raw_scores, -60, 60)
+        scores = 1.0 / (1.0 + np.exp(-safe_scores))
 
-        relevant_results.sort(
-            key=lambda x: x["hybrid_score"],
-            reverse=True
-        )
+        results = []
+        for candidate, score, raw_score in zip(candidates, scores, raw_scores):
+            result = candidate.copy()
+            result["rerank_score"] = float(score)
+            result["rerank_raw_score"] = float(raw_score)
+            results.append(result)
 
-        return relevant_results[:final_top_k]
+        results.sort(key=lambda item: item["rerank_score"], reverse=True)
 
-    # ========================================================
-    # COMPLETE SEARCH
-    # ========================================================
+        for result in results:
+            print(
+                f"RERANK DEBUG | score={result['rerank_score']:.4f} "
+                f"| raw={result['rerank_raw_score']:.4f} "
+                f"| threshold={threshold:.2f} "
+                f"| text={result['text'][:120]!r}"
+            )
 
-    def search(
-        self,
-        query,
-        final_top_k=FINAL_TOP_K,
-        threshold=RERANK_THRESHOLD
-    ):
+        relevant = [item for item in results if item["rerank_score"] >= threshold]
 
-        candidates = self.retrieve_candidates(
-            query
-        )
+        # If no chunk passes the gate, refuse rather than send weak context to the LLM.
+        return relevant[:final_top_k]
 
-        results = self.rerank(
+    def search(self, query, final_top_k=FINAL_TOP_K, threshold=RERANK_THRESHOLD):
+        candidates = self.retrieve_candidates(query)
+        return self.rerank(
             query,
             candidates,
             final_top_k=final_top_k,
-            threshold=threshold
+            threshold=threshold,
         )
 
-        return results
-
 
 # ============================================================
-# OLLAMA
+# OLLAMA ANSWER GENERATION
 # ============================================================
 
-def ask_ollama(
-    query,
-    context
-):
-
+def ask_ollama(query, context):
     system_prompt = """
-You are a loan customer support assistant.
+You are a careful bank customer-support assistant.
 
-Answer the user's question using ONLY the provided context.
+Use ONLY the supplied knowledge context to answer the user's question.
 
 Rules:
-
-1. Do not use outside knowledge.
-2. Do not invent information.
-3. Do not assume missing information.
-4. Do not transfer information from one loan type,
-   product, or category to another.
-5. If the answer is not present in the context,
-   say exactly:
-   "I don't have that information."
-6. Keep the answer short and conversational.
+1. Answer every distinct part of a multi-part question.
+2. Use only facts explicitly supported by the context.
+3. Never guess, infer a policy, or fill gaps with general knowledge.
+4. Distinguish minimum, maximum, starting, and guaranteed values.
+5. If the context says something is not specified, clearly say it is not specified.
+6. If the context answers only part of the question, answer that part and clearly state which remaining detail is not available.
+7. Do not say an application is approved or guaranteed unless the context explicitly says so.
+8. Keep the answer concise and conversational.
+9. If the context contains no answer to any part of the question, reply exactly:
+I don't have that information.
 """
 
-    user_prompt = f"""
-Context:
-
+    user_prompt = f"""KNOWLEDGE CONTEXT:
 {context}
 
-
-User question:
-
+USER QUESTION:
 {query}
-"""
+
+Answer from the context only. Check each part of the question before responding."""
 
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": user_prompt
-            }
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
         "stream": False,
         "options": {
-            "num_predict": 60
-        }
+            "temperature": 0,
+            "top_p": 0.1,
+            "num_predict": 120,
+        },
     }
 
     try:
-
-        response = requests.post(
-            OLLAMA_URL,
-            json=payload,
-            timeout=120
-        )
-
+        response = requests.post(OLLAMA_URL, json=payload, timeout=120)
         response.raise_for_status()
-
         data = response.json()
-
-        return data["message"]["content"].strip()
-
-    except Exception as e:
-
-        return (
-            f"Ollama error: {e}"
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    retriever = HybridRetriever()
-
-    print("\nType 'exit' to quit.\n")
-
-    while True:
-
-        query = input("You: ").strip()
-
-        if query.lower() == "exit":
-            break
-
-        if not query:
-            continue
-
-        # ----------------------------------------------------
-        # Search
-        # ----------------------------------------------------
-
-        results = retriever.search(
-            query
-        )
-
-        print("\nRetrieved Results:")
-
-        if not results:
-
-            print(
-                "No sufficiently relevant "
-                "information found."
-            )
-
-            print()
-
-            continue
-
-        # ----------------------------------------------------
-        # Display retrieved chunks
-        # ----------------------------------------------------
-
-        for result in results:
-
-            print(
-                f"\nRerank Score: "
-                f"{result['rerank_score']:.4f}"
-            )
-
-            print(
-                f"Source: "
-                f"{result['source']}"
-            )
-
-            print(
-                result["text"]
-            )
-
-        # ----------------------------------------------------
-        # Build context
-        # ----------------------------------------------------
-
-        context = "\n\n".join(
-            result["text"]
-            for result in results
-        )
-
-        # ----------------------------------------------------
-        # Ask Ollama
-        # ----------------------------------------------------
-
-        answer = ask_ollama(
-            query,
-            context
-        )
-
-        print(
-            f"\nAssistant: {answer}"
-        )
-
-        print()
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
-
-if __name__ == "__main__":
-    main()
+        answer = data.get("message", {}).get("content", "").strip()
+        return answer or "I don't have that information."
+    except Exception as exc:
+        print(f"Ollama request failed: {exc}")
+        return "I'm unable to retrieve an answer right now."
