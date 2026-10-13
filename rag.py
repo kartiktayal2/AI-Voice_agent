@@ -1,5 +1,6 @@
 from pathlib import Path
 import re
+import time
 
 import faiss
 import numpy as np
@@ -12,7 +13,9 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 # CONFIGURATION
 # ============================================================
 
-KNOWLEDGE_DIR = Path("knowledge")
+BASE_DIR = Path(__file__).resolve().parent
+KNOWLEDGE_DIR = BASE_DIR / "knowledge"
+MODEL_CACHE_DIR = BASE_DIR / "models" / "huggingface"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -20,58 +23,47 @@ RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "qwen2.5:0.5b"
 
-# Retrieve broadly first; let the cross-encoder rank the union.
 RETRIEVAL_TOP_K = 12
 FINAL_TOP_K = 5
 
-# This is a sigmoid-transformed cross-encoder score, NOT a calibrated
-# probability. A lower gate avoids rejecting borderline relevant chunks.
+# This is a relevance gate, not a probability or confidence score.
 RERANK_THRESHOLD = 0.35
+OLLAMA_TIMEOUT = 120
+MAX_CONTEXT_CHARS = 12000
 
 
 # ============================================================
-# TEXT / CHUNKING HELPERS
+# TEXT / CHUNKING
 # ============================================================
 
 def _tokenize(text):
-    """Tokenize words and numbers consistently for BM25."""
-    return re.findall(r"[a-z]+(?:'[a-z]+)?|\d+(?:[.,]\d+)*|₹|%", text.lower())
+    """Consistent lightweight tokenization for lexical retrieval."""
+    return re.findall(r"[a-z]+(?:'[a-z]+)?|\d+(?:[.,]\d+)?|₹|%", text.lower())
 
 
 def _is_heading(line):
-    """Recognize actual section headings without treating every short line as one."""
     line = line.strip()
     if not line:
         return False
-
     if re.match(r"^#{1,6}\s+", line):
         return True
     if re.match(r"^\*\*[^*]{2,100}\*\*$", line):
         inner = line[2:-2].strip()
-        if not inner.lower().startswith(("q:", "a:")) and "?" not in inner:
-            return True
-
-    numbered_heading = re.match(r"^(?:\d+(?:\.\d+)*[.)]?\s+).{2,100}$", line)
-    if numbered_heading and not line.rstrip().endswith((".", "?", "!")):
-        return True
-
-    # Plain-text headings such as "Personal Loan" or "Loan Repayment".
-    # Do not treat questions, answers, or sentence-like lines as headings.
+        return "?" not in inner and not inner.lower().startswith(("q:", "a:"))
     if (
         len(line.split()) <= 7
-        and not re.match(r"^(?:q|a)\s*:", line, flags=re.I)
         and not any(mark in line for mark in ("?", "!", ".", ";"))
-        and not re.match(r"^[\-*]\s+", line)
+        and not re.match(r"^(?:q|a)\s*:", line, flags=re.I)
+        and not re.match(r"^[-*]\s+", line)
     ):
         return True
-
     return False
 
 
 def chunk_text(text, max_words=120):
     """
-    Build heading-aware chunks while keeping paragraphs and FAQ answers together.
-    Headings are repeated in each chunk from their section for retrieval context.
+    Split text into heading-aware chunks.
+    Keep paragraphs and FAQ answers together where possible.
     """
     paragraphs = [
         part.strip()
@@ -84,7 +76,7 @@ def chunk_text(text, max_words=120):
     current_paragraphs = []
 
     def flush_section():
-        nonlocal current_heading, current_paragraphs
+        nonlocal current_paragraphs
         if current_heading or current_paragraphs:
             sections.append((current_heading, current_paragraphs[:]))
         current_paragraphs = []
@@ -100,86 +92,103 @@ def chunk_text(text, max_words=120):
             if remainder:
                 current_paragraphs.append(remainder)
         else:
-            # If a heading wasn't detected, preserve the paragraph as content.
             current_paragraphs.append(paragraph)
 
     flush_section()
-
     chunks = []
 
     for heading, section_paragraphs in sections:
         prefix = heading.strip()
-        content_parts = []
+        current_parts = []
         current_count = len(_tokenize(prefix)) if prefix else 0
 
         def emit():
-            nonlocal content_parts, current_count
-            if not content_parts:
+            nonlocal current_parts, current_count
+            if not current_parts:
                 return
-            body = "\n".join(content_parts).strip()
+            body = "\n".join(current_parts).strip()
             chunk = f"{prefix}\n{body}".strip() if prefix else body
             if chunk:
                 chunks.append(chunk)
-            content_parts = []
+            current_parts = []
             current_count = len(_tokenize(prefix)) if prefix else 0
 
         for paragraph in section_paragraphs:
-            paragraph_words = _tokenize(paragraph)
-
-            # Split only an unusually long paragraph, preferably at sentence boundaries.
             pieces = [paragraph]
-            if len(paragraph_words) > max_words:
+            if len(_tokenize(paragraph)) > max_words:
                 sentences = re.split(r"(?<=[.!?])\s+", paragraph.strip())
                 pieces = []
-                sentence_group = []
-                sentence_count = 0
+                group = []
+                group_size = 0
 
                 for sentence in sentences:
                     sentence_size = len(_tokenize(sentence))
-                    if sentence_group and sentence_count + sentence_size > max_words:
-                        pieces.append(" ".join(sentence_group))
-                        sentence_group = []
-                        sentence_count = 0
-                    if sentence_size > max_words:
-                        if sentence_group:
-                            pieces.append(" ".join(sentence_group))
-                            sentence_group = []
-                            sentence_count = 0
-                        words = sentence.split()
-                        for start in range(0, len(words), max_words):
-                            pieces.append(" ".join(words[start:start + max_words]))
-                    else:
-                        sentence_group.append(sentence)
-                        sentence_count += sentence_size
+                    if group and group_size + sentence_size > max_words:
+                        pieces.append(" ".join(group))
+                        group, group_size = [], 0
 
-                if sentence_group:
-                    pieces.append(" ".join(sentence_group))
+                    if sentence_size > max_words:
+                        if group:
+                            pieces.append(" ".join(group))
+                            group, group_size = [], 0
+                        words = sentence.split()
+                        pieces.extend(
+                            " ".join(words[start:start + max_words])
+                            for start in range(0, len(words), max_words)
+                        )
+                    else:
+                        group.append(sentence)
+                        group_size += sentence_size
+
+                if group:
+                    pieces.append(" ".join(group))
 
             for piece in pieces:
-                piece_count = len(_tokenize(piece))
-                if content_parts and current_count + piece_count > max_words:
+                piece_size = len(_tokenize(piece))
+                if current_parts and current_count + piece_size > max_words:
                     emit()
-                content_parts.append(piece.strip())
-                current_count += piece_count
-
+                current_parts.append(piece.strip())
+                current_count += piece_size
         emit()
 
     return [chunk for chunk in chunks if chunk.strip()]
 
 
+def split_question(query):
+    """
+    Split obvious multi-question input into independently answerable parts.
+    Avoid splitting ordinary lists such as 'identity and address proof'.
+    """
+    text = re.sub(r"\s+", " ", (query or "").strip())
+    if not text:
+        return []
+
+    # Question marks are the clearest boundary.
+    question_parts = [p.strip(" ,.;!") for p in re.split(r"\?\s*", text) if p.strip(" ,.;!?")]
+    if len(question_parts) > 1:
+        return question_parts
+
+    # Split conjunctions only when a new question-like clause starts.
+    pattern = re.compile(
+        r"\s+(?:and|also)\s+(?=(?:what|where|when|who|which|why|how|"
+        r"is|are|can|could|do|does|did|will|would|tell me|explain)\b)",
+        flags=re.IGNORECASE,
+    )
+    parts = [p.strip(" ,.;!?") for p in pattern.split(text) if p.strip(" ,.;!?")]
+    return parts or [text]
+
+
 # ============================================================
-# LOAD DOCUMENTS
+# LOAD KNOWLEDGE
 # ============================================================
 
 def load_documents():
-    documents = []
-    print("Loading documents...")
-
     if not KNOWLEDGE_DIR.exists():
         raise FileNotFoundError(
-            f"Knowledge directory not found: {KNOWLEDGE_DIR.resolve()}"
+            f"Knowledge directory not found: {KNOWLEDGE_DIR}"
         )
 
+    documents = []
     for file_path in sorted(KNOWLEDGE_DIR.glob("*.txt")):
         text = file_path.read_text(encoding="utf-8").strip()
         if text:
@@ -187,9 +196,8 @@ def load_documents():
 
     if not documents:
         raise FileNotFoundError(
-            f"No non-empty .txt knowledge files found in {KNOWLEDGE_DIR.resolve()}"
+            f"No non-empty .txt knowledge files found in {KNOWLEDGE_DIR}"
         )
-
     return documents
 
 
@@ -200,11 +208,9 @@ def load_documents():
 class HybridRetriever:
     def __init__(self):
         print("Loading RAG system...")
-
-        documents = load_documents()
         self.chunks = []
 
-        for document in documents:
+        for document in load_documents():
             for chunk in chunk_text(document["text"]):
                 self.chunks.append({
                     "source": document["source"],
@@ -212,12 +218,14 @@ class HybridRetriever:
                 })
 
         if not self.chunks:
-            raise ValueError("The knowledge files did not produce any searchable chunks.")
+            raise ValueError("Knowledge files did not produce searchable chunks.")
 
         print(f"Total chunks: {len(self.chunks)}")
-
         print("Loading embedding model...")
-        self.embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        self.embedding_model = SentenceTransformer(
+            EMBEDDING_MODEL,
+            cache_folder=str(MODEL_CACHE_DIR),
+        )
 
         texts = [chunk["text"] for chunk in self.chunks]
         embeddings = self.embedding_model.encode(
@@ -229,21 +237,18 @@ class HybridRetriever:
 
         self.faiss_index = faiss.IndexFlatIP(embeddings.shape[1])
         self.faiss_index.add(embeddings)
-        print("FAISS index created.")
-
         self.bm25 = BM25Okapi([_tokenize(text) for text in texts])
-        print("BM25 index created.")
 
         print("Loading reranker model...")
         self.reranker = CrossEncoder(RERANKER_MODEL)
-        print("Reranker loaded.")
         print("RAG system ready.")
 
     def retrieve_candidates(self, query, top_k=RETRIEVAL_TOP_K):
-        """Return the union of vector and lexical candidates; don't truncate the union."""
         count = len(self.chunks)
-        k = min(top_k, count)
+        if count == 0:
+            return []
 
+        k = min(top_k, count)
         query_embedding = self.embedding_model.encode(
             [query],
             convert_to_numpy=True,
@@ -255,18 +260,21 @@ class HybridRetriever:
         vector_scores = vector_scores[0]
         vector_indices = vector_indices[0]
 
-        bm25_scores = np.asarray(self.bm25.get_scores(_tokenize(query)), dtype="float32")
+        bm25_scores = np.asarray(
+            self.bm25.get_scores(_tokenize(query)),
+            dtype="float32",
+        )
         bm25_top_indices = np.argsort(bm25_scores)[::-1][:k]
-
         max_bm25 = float(bm25_scores.max()) if bm25_scores.size else 0.0
-        normalized_bm25 = bm25_scores / max_bm25 if max_bm25 > 0 else np.zeros_like(bm25_scores)
+        normalized_bm25 = (
+            bm25_scores / max_bm25 if max_bm25 > 0 else np.zeros_like(bm25_scores)
+        )
 
         vector_score_by_index = {
             int(index): float(score)
             for score, index in zip(vector_scores, vector_indices)
             if int(index) >= 0
         }
-
         candidate_indices = set(vector_score_by_index)
         candidate_indices.update(int(index) for index in bm25_top_indices)
 
@@ -274,120 +282,234 @@ class HybridRetriever:
         for index in candidate_indices:
             vector_score = vector_score_by_index.get(index, 0.0)
             bm25_score = float(normalized_bm25[index])
-            hybrid_score = 0.6 * vector_score + 0.4 * bm25_score
-
             candidates.append({
                 "index": index,
                 "source": self.chunks[index]["source"],
                 "text": self.chunks[index]["text"],
                 "vector_score": vector_score,
                 "bm25_score": bm25_score,
-                "hybrid_score": hybrid_score,
+                "hybrid_score": 0.6 * vector_score + 0.4 * bm25_score,
             })
 
         candidates.sort(key=lambda item: item["hybrid_score"], reverse=True)
         print(
-            f"RETRIEVAL DEBUG | vector candidates={len(vector_score_by_index)} "
-            f"| BM25 candidates={len(bm25_top_indices)} "
-            f"| unique candidates={len(candidates)}"
+            f"RETRIEVAL DEBUG | vector={len(vector_score_by_index)} "
+            f"| BM25={len(bm25_top_indices)} | unique={len(candidates)}"
         )
         return candidates
 
-    def rerank(self, query, candidates, final_top_k=FINAL_TOP_K, threshold=RERANK_THRESHOLD):
+    def rerank(self, query, candidates, final_top_k=FINAL_TOP_K,
+               threshold=RERANK_THRESHOLD):
         if not candidates:
             return []
 
-        pairs = [[query, candidate["text"]] for candidate in candidates]
-        raw_scores = np.asarray(self.reranker.predict(pairs), dtype="float32").reshape(-1)
+        pairs = [[query, item["text"]] for item in candidates]
+        raw_scores = np.asarray(
+            self.reranker.predict(pairs), dtype="float32"
+        ).reshape(-1)
 
-        # CrossEncoder logits are not calibrated probabilities. Sigmoid is retained
-        # only as a monotonic score transform for compatibility with existing logs.
+        # Sigmoid is only used to make the reranker score easier to inspect.
         safe_scores = np.clip(raw_scores, -60, 60)
         scores = 1.0 / (1.0 + np.exp(-safe_scores))
 
         results = []
         for candidate, score, raw_score in zip(candidates, scores, raw_scores):
-            result = candidate.copy()
-            result["rerank_score"] = float(score)
-            result["rerank_raw_score"] = float(raw_score)
-            results.append(result)
+            item = candidate.copy()
+            item["rerank_score"] = float(score)
+            item["rerank_raw_score"] = float(raw_score)
+            results.append(item)
 
         results.sort(key=lambda item: item["rerank_score"], reverse=True)
-
-        for result in results:
+        for item in results:
             print(
-                f"RERANK DEBUG | score={result['rerank_score']:.4f} "
-                f"| raw={result['rerank_raw_score']:.4f} "
-                f"| threshold={threshold:.2f} "
-                f"| text={result['text'][:120]!r}"
+                f"RERANK DEBUG | score={item['rerank_score']:.4f} "
+                f"| raw={item['rerank_raw_score']:.4f} "
+                f"| text={item['text'][:100]!r}"
             )
 
-        relevant = [item for item in results if item["rerank_score"] >= threshold]
+        return [
+            item for item in results
+            if item["rerank_score"] >= threshold
+        ][:final_top_k]
 
-        # If no chunk passes the gate, refuse rather than send weak context to the LLM.
-        return relevant[:final_top_k]
+    def search(self, query, final_top_k=FINAL_TOP_K,
+               threshold=RERANK_THRESHOLD):
+        """Search each clear question part and retain evidence for each part."""
+        parts = split_question(query)
+        if not parts:
+            return []
 
-    def search(self, query, final_top_k=FINAL_TOP_K, threshold=RERANK_THRESHOLD):
-        candidates = self.retrieve_candidates(query)
-        return self.rerank(
-            query,
-            candidates,
-            final_top_k=final_top_k,
-            threshold=threshold,
-        )
+        combined = []
+        seen = set()
+
+        for part in parts:
+            print(f"RAG SEARCH PART: {part}")
+            candidates = self.retrieve_candidates(part)
+            matches = self.rerank(
+                part, candidates,
+                final_top_k=final_top_k,
+                threshold=threshold,
+            )
+            for result in matches:
+                key = (result["source"], result["text"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                result = result.copy()
+                result["matched_question_part"] = part
+                combined.append(result)
+
+        # Preserve each matched part for the answer generator and debugging.
+        return combined
 
 
 # ============================================================
-# OLLAMA ANSWER GENERATION
+# GROUNDED ANSWER GENERATION
 # ============================================================
 
-def ask_ollama(query, context):
-    system_prompt = """
-You are a careful bank customer-support assistant.
+def _context_to_text(context):
+    """Accept the string format used by main.py or retrieved result dictionaries."""
+    if context is None:
+        return ""
+    if isinstance(context, str):
+        return context.strip()
+    if isinstance(context, (list, tuple)):
+        blocks = []
+        for item in context:
+            if isinstance(item, dict):
+                source = item.get("source", "unknown source")
+                text = item.get("text", "")
+                matched_part = item.get("matched_question_part")
+                if text:
+                    prefix = f"Source: {source}"
+                    if matched_part:
+                        prefix += f" | Retrieved for: {matched_part}"
+                    blocks.append(f"{prefix}\n{text}")
+            else:
+                blocks.append(str(item))
+        return "\n\n".join(blocks).strip()
+    return str(context).strip()
 
-Use ONLY the supplied knowledge context to answer the user's question.
 
-Rules:
-1. Answer every distinct part of a multi-part question.
-2. Use only facts explicitly supported by the context.
-3. Never guess, infer a policy, or fill gaps with general knowledge.
-4. Distinguish minimum, maximum, starting, and guaranteed values.
-5. If the context says something is not specified, clearly say it is not specified.
-6. If the context answers only part of the question, answer that part and clearly state which remaining detail is not available.
-7. Do not say an application is approved or guaranteed unless the context explicitly says so.
-8. Keep the answer concise and conversational.
-9. If the context contains no answer to any part of the question, reply exactly:
-I don't have that information.
-"""
-
-    user_prompt = f"""KNOWLEDGE CONTEXT:
-{context}
-
-USER QUESTION:
-{query}
-
-Answer from the context only. Check each part of the question before responding."""
-
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "options": {
-            "temperature": 0,
-            "top_p": 0.1,
-            "num_predict": 120,
-        },
+def _meaningful_tokens(text):
+    stop_words = {
+        "what", "which", "how", "does", "did", "are", "is", "the", "a", "an",
+        "for", "of", "to", "i", "can", "you", "me", "my", "and", "on", "in",
+        "from", "please", "tell", "explain", "about", "would", "could", "should",
+        "do", "it", "be", "this", "that", "with", "have", "has", "had",
+    }
+    return {
+        token for token in _tokenize(text)
+        if token not in stop_words and len(token) > 1
     }
 
-    try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=120)
-        response.raise_for_status()
-        data = response.json()
-        answer = data.get("message", {}).get("content", "").strip()
-        return answer or "I don't have that information."
-    except Exception as exc:
-        print(f"Ollama request failed: {exc}")
-        return "I'm unable to retrieve an answer right now."
+
+def _context_is_relevant(question, context):
+    """
+    Conservative, general-purpose evidence check.
+    This does not encode any loan facts or domain-specific field names.
+    """
+    question_tokens = _meaningful_tokens(question)
+    context_tokens = _meaningful_tokens(context)
+    if not question_tokens or not context_tokens:
+        return False
+
+    overlap = question_tokens.intersection(context_tokens)
+    # One strong shared term is often enough for short questions; longer
+    # questions need a little more overlap to reduce unrelated-context leakage.
+    needed = 1 if len(question_tokens) <= 4 else 2
+    return len(overlap) >= needed
+
+
+def ask_ollama(query, context):
+    """
+    Generate answers from retrieved knowledge only.
+    No policy values, field-specific answers, or domain names are hard-coded.
+    """
+    started = time.perf_counter()
+    parts = split_question(query)
+    context_text = _context_to_text(context)
+
+    if not parts:
+        return "Please ask a question."
+
+    if not context_text:
+        return (
+            "I couldn't find supporting information for that in the available "
+            "knowledge base. Please check the source documents or ask about a "
+            "detail covered there."
+        )
+
+    answers = []
+    for part in parts:
+        # Avoid passing unrelated retrieved chunks to the small model.
+        if not _context_is_relevant(part, context_text):
+            answers.append(
+                f"I couldn't find supporting information for '{part}' in the "
+                "available knowledge base."
+            )
+            continue
+
+        system_prompt = """
+You are a careful customer-support assistant answering from a supplied knowledge base.
+
+Rules:
+- Use only information explicitly supported by the supplied context.
+- Do not use general knowledge, assumptions, guesses, or facts from memory.
+- Answer only the current question part.
+- Check every clause in the question and answer every part that the context supports.
+- Do not confuse a starting value with a maximum, a minimum with a maximum, or a possible outcome with a guarantee.
+- If a requested detail is absent, say it is not specified in the available context.
+- If a calculation is requested, calculate only when the context supplies every required input. Otherwise state which inputs are missing.
+- Do not invent numbers, dates, locations, requirements, or policy details.
+- Give a complete answer in concise, natural spoken English. Never stop mid-sentence.
+- Return only the answer, with no explanation of these instructions.
+"""
+
+        user_prompt = f"""AVAILABLE KNOWLEDGE:
+{context_text[:MAX_CONTEXT_CHARS]}
+
+QUESTION PART:
+{part}
+
+Answer this question part using only the available knowledge above.
+If the context does not support a requested fact, explicitly say that it is not available.
+"""
+
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
+            "options": {
+                "temperature": 0,
+                "top_p": 0.1,
+                "num_predict": 220,
+            },
+        }
+
+        try:
+            response = requests.post(
+                OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT
+            )
+            response.raise_for_status()
+            answer = response.json().get("message", {}).get("content", "").strip()
+            if answer:
+                answers.append(answer)
+            else:
+                answers.append(
+                    f"I couldn't generate a supported answer for '{part}'."
+                )
+        except requests.RequestException as exc:
+            print(f"Ollama request failed for question part {part!r}: {exc}")
+            answers.append(
+                "I'm having trouble generating the answer right now. Please try again."
+            )
+
+    final_answer = " ".join(answer.strip() for answer in answers if answer.strip())
+    print(f"ANSWER GENERATION TOTAL: {time.perf_counter() - started:.2f}s")
+    return final_answer or (
+        "I couldn't find supporting information in the available knowledge base."
+    )

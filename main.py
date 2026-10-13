@@ -1,36 +1,37 @@
+import asyncio
 import time
-import os
 import wave
+from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
-
 from faster_whisper import WhisperModel
 from piper import PiperVoice
 
-# IMPORTANT:
-# RAG + Ollama are handled only by rag.py
 from rag import HybridRetriever, ask_ollama
 
 
 # ============================================================
-# APP
+# PATHS AND CONFIGURATION
 # ============================================================
 
-app = FastAPI()
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
+# Resolve paths relative to this file, so the app can be started
+# from another working directory.
+BASE_DIR = Path(__file__).resolve().parent
+TEMPLATE_PATH = BASE_DIR / "templates" / "index.html"
+AUDIO_DIR = BASE_DIR / "audio"
+INPUT_AUDIO = AUDIO_DIR / "browser_input.webm"
+OUTPUT_AUDIO = AUDIO_DIR / "browser_response.wav"
 
 WHISPER_MODEL = "distil-small.en"
+PIPER_MODEL = BASE_DIR / "en_US-lessac-medium.onnx"
 
-PIPER_MODEL = "en_US-lessac-medium.onnx"
+app = FastAPI(title="Loan Policy Voice Assistant")
 
-INPUT_AUDIO = "audio/browser_input.webm"
-OUTPUT_AUDIO = "audio/browser_response.wav"
+# The frontend uses shared audio filenames. Serialize voice requests so
+# two requests cannot overwrite each other's input/output audio files.
+voice_lock = asyncio.Lock()
 
 
 # ============================================================
@@ -38,13 +39,11 @@ OUTPUT_AUDIO = "audio/browser_response.wav"
 # ============================================================
 
 print("Loading Whisper...")
-
 whisper_model = WhisperModel(
     WHISPER_MODEL,
     device="cpu",
-    compute_type="int8"
+    compute_type="int8",
 )
-
 print("Whisper loaded.")
 
 
@@ -53,19 +52,17 @@ print("Whisper loaded.")
 # ============================================================
 
 print("Loading Piper...")
-
 piper_start = time.time()
 
-piper_voice = PiperVoice.load(
-    PIPER_MODEL
-)
+if not PIPER_MODEL.exists():
+    raise FileNotFoundError(
+        f"Piper voice model not found: {PIPER_MODEL}. "
+        "Update PIPER_MODEL to the path of your existing .onnx voice model."
+    )
 
+piper_voice = PiperVoice.load(str(PIPER_MODEL))
 piper_load_time = time.time() - piper_start
-
-print(
-    f"Piper loaded in "
-    f"{piper_load_time:.2f} seconds."
-)
+print(f"Piper loaded in {piper_load_time:.2f} seconds.")
 
 
 # ============================================================
@@ -73,18 +70,10 @@ print(
 # ============================================================
 
 print("\nLoading RAG system...")
-
 rag_start = time.time()
-
 rag_retriever = HybridRetriever()
-
 rag_load_time = time.time() - rag_start
-
-print(
-    f"RAG system loaded in "
-    f"{rag_load_time:.2f} seconds."
-)
-
+print(f"RAG system loaded in {rag_load_time:.2f} seconds.")
 print("RAG ready.")
 
 
@@ -97,70 +86,63 @@ class ChatRequest(BaseModel):
 
 
 # ============================================================
-# HOME PAGE
+# HOME PAGE AND HEALTH CHECK
 # ============================================================
 
 @app.get("/", response_class=HTMLResponse)
 def home():
+    if not TEMPLATE_PATH.exists():
+        return HTMLResponse("Frontend template not found.", status_code=404)
 
-    with open(
-        "templates/index.html",
-        "r",
-        encoding="utf-8"
-    ) as file:
+    return TEMPLATE_PATH.read_text(encoding="utf-8")
 
-        return file.read()
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "rag_loaded": rag_retriever is not None}
 
 
 # ============================================================
-# RAG
+# RAG RETRIEVAL
 # ============================================================
 
-def retrieve_context(user_message):
-
+def retrieve_context(user_message: str) -> str:
+    """
+    Retrieve relevant chunks and return them as a labelled string.
+    Returning a string keeps this compatible with rag.py implementations
+    that process context using string operations such as splitlines().
+    An empty string means no sufficiently relevant chunks were found.
+    """
     print("\nSearching knowledge base...")
-
-    results = rag_retriever.search(
-        user_message
-    )
+    results = rag_retriever.search(user_message)
 
     if not results:
-
-        print(
-            "No sufficiently relevant information found."
-        )
-
-        return None
+        print("No sufficiently relevant information found for any question part.")
+        return ""
 
     print("\nRetrieved Context:")
-
     context_parts = []
 
     for result in results:
+        question_part = result.get("matched_question_part", user_message)
+        score = result.get("rerank_score", 0.0)
+        source = result.get("source", "unknown")
+        text = result.get("text", "")
 
-        print(
-            f"\nRerank Score: "
-            f"{result['rerank_score']:.4f}"
-        )
+        print(f"\nQuestion part: {question_part}")
+        print(f"Rerank Score: {score:.4f}")
+        print(f"Source: {source}")
+        print(text)
 
-        print(
-            f"Source: "
-            f"{result['source']}"
-        )
-
-        print(
-            result["text"]
-        )
-
+        # Keep labels in the context so the answer model can distinguish
+        # which retrieved passage relates to which part of a compound query.
         context_parts.append(
-            result["text"]
+            f"Question part: {question_part}\n"
+            f"Source: {source}\n"
+            f"Retrieved information:\n{text}"
         )
 
-    context = "\n\n".join(
-        context_parts
-    )
-
-    return context
+    return "\n\n".join(context_parts)
 
 
 # ============================================================
@@ -169,367 +151,155 @@ def retrieve_context(user_message):
 
 @app.post("/chat")
 def chat(request: ChatRequest):
+    message = request.message.strip()
+
+    if not message:
+        return {"response": "Please enter a question."}
 
     print("\n" + "=" * 50)
     print("TEXT CHAT")
-    print("USER:")
-    print(request.message)
+    print("USER:", message)
 
-    # --------------------------------------------------------
-    # RAG Retrieval
-    # --------------------------------------------------------
-
+    # RAG timing
     rag_start = time.time()
-
-    context = retrieve_context(
-        request.message
-    )
-
+    context = retrieve_context(message)
     rag_time = time.time() - rag_start
 
-    # --------------------------------------------------------
-    # No Relevant Knowledge
-    # --------------------------------------------------------
-
-    if context is None:
-
-        ai_response = (
-            "I don't have that information."
-        )
-
-        print("\nAI:")
-        print(ai_response)
-
-        print(
-            f"\nRAG time: "
-            f"{rag_time:.2f} seconds"
-        )
-
-        print("=" * 50)
-
-        return {
-            "response": ai_response
-        }
-
-    # --------------------------------------------------------
-    # Ollama
-    #
-    # ask_ollama comes directly from rag.py
-    # --------------------------------------------------------
-
+    # Always call ask_ollama, even if context is empty, so rag.py can
+    # provide a conversational, question-specific refusal.
     ollama_start = time.time()
-
-    ai_response = ask_ollama(
-        request.message,
-        context
-    )
-
+    ai_response = ask_ollama(message, context)
     ollama_time = time.time() - ollama_start
 
     print("\nAI:")
     print(ai_response)
-
-    print(
-        f"\nRAG time: "
-        f"{rag_time:.2f} seconds"
-    )
-
-    print(
-        f"Ollama time: "
-        f"{ollama_time:.2f} seconds"
-    )
-
+    print(f"\nRAG time: {rag_time:.2f} seconds")
+    print(f"Ollama time: {ollama_time:.2f} seconds")
     print("=" * 50)
 
-    return {
-        "response": ai_response
-    }
+    return {"response": ai_response}
 
 
 # ============================================================
-# VOICE
+# VOICE INPUT
 # ============================================================
 
 @app.post("/voice")
-async def voice(
-    file: UploadFile = File(...)
-):
+async def voice(file: UploadFile = File(...)):
+    async with voice_lock:
+        return await _process_voice(file)
 
+
+async def _process_voice(file: UploadFile):
     print("\n" + "=" * 50)
     print("VOICE INPUT RECEIVED")
-
     total_start = time.time()
 
     # --------------------------------------------------------
-    # Save Browser Audio
+    # Save browser audio
     # --------------------------------------------------------
-
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     audio_data = await file.read()
 
-    print(
-        f"Audio file size: "
-        f"{len(audio_data) / 1024:.2f} KB"
-    )
+    print(f"Audio file size: {len(audio_data) / 1024:.2f} KB")
 
-    os.makedirs(
-        "audio",
-        exist_ok=True
-    )
+    if not audio_data:
+        print("Empty audio upload received.")
+        print("=" * 50)
+        return {
+            "user_text": "",
+            "response": "I couldn't hear you. Please try again.",
+            "audio": None,
+        }
 
-    with open(
-        INPUT_AUDIO,
-        "wb"
-    ) as audio_file:
-
-        audio_file.write(
-            audio_data
-        )
-
+    INPUT_AUDIO.write_bytes(audio_data)
     print("Audio received.")
 
     # --------------------------------------------------------
-    # Speech → Text
+    # Speech to text (VAD disabled, as requested)
     # --------------------------------------------------------
-
     whisper_start = time.time()
-
     print("\nTranscribing...")
 
     segments, info = whisper_model.transcribe(
-        INPUT_AUDIO,
+        str(INPUT_AUDIO),
         language="en",
         beam_size=1,
         best_of=1,
         temperature=0,
         condition_on_previous_text=False,
-        vad_filter=False
+        vad_filter=False,
     )
 
-    user_text = ""
-
-    for segment in segments:
-
-        user_text += (
-            segment.text + " "
-        )
-
-    user_text = user_text.strip()
-
-    whisper_time = (
-        time.time() - whisper_start
-    )
+    user_text = " ".join(segment.text.strip() for segment in segments).strip()
+    whisper_time = time.time() - whisper_start
 
     print("\nUSER:")
     print(user_text)
-
-    print(
-        f"\nWhisper time: "
-        f"{whisper_time:.2f} seconds"
-    )
-
-    # --------------------------------------------------------
-    # No Speech Detected
-    # --------------------------------------------------------
+    print(f"\nWhisper time: {whisper_time:.2f} seconds")
 
     if not user_text:
-
+        total_time = time.time() - total_start
+        print("\nNo speech detected.")
+        print(f"Whisper: {whisper_time:.2f}s")
+        print(f"TOTAL: {total_time:.2f}s")
+        print("=" * 50)
         return {
             "user_text": "",
-            "response": "I couldn't hear you.",
-            "audio": None
+            "response": "I couldn't hear you. Please try again.",
+            "audio": None,
         }
 
     # --------------------------------------------------------
-    # RAG Retrieval
+    # RAG retrieval
     # --------------------------------------------------------
-
     rag_start = time.time()
-
-    context = retrieve_context(
-        user_text
-    )
-
-    rag_time = (
-        time.time() - rag_start
-    )
+    context = retrieve_context(user_text)
+    rag_time = time.time() - rag_start
 
     # --------------------------------------------------------
-    # No Relevant Information
+    # Ollama / answer generation and refusal handling
     # --------------------------------------------------------
-
-    if context is None:
-
-        ai_response = (
-            "I don't have that information."
-        )
-
-        print("\nAI:")
-        print(ai_response)
-
-        # ----------------------------------------------------
-        # Text → Speech
-        # ----------------------------------------------------
-
-        piper_start = time.time()
-
-        print("\nGenerating voice...")
-
-        with wave.open(
-            OUTPUT_AUDIO,
-            "wb"
-        ) as wav_file:
-
-            piper_voice.synthesize_wav(
-                ai_response,
-                wav_file
-            )
-
-        piper_time = (
-            time.time() - piper_start
-        )
-
-        print("Voice generated.")
-
-        print(
-            f"Piper generation time: "
-            f"{piper_time:.2f} seconds"
-        )
-
-        total_time = (
-            time.time() - total_start
-        )
-
-        print("\n" + "-" * 50)
-
-        print(
-            f"Whisper : "
-            f"{whisper_time:.2f}s"
-        )
-
-        print(
-            f"RAG     : "
-            f"{rag_time:.2f}s"
-        )
-
-        print(
-            f"Piper   : "
-            f"{piper_time:.2f}s"
-        )
-
-        print(
-            f"TOTAL   : "
-            f"{total_time:.2f}s"
-        )
-
-        print("-" * 50)
-        print("=" * 50)
-
-        return {
-            "user_text": user_text,
-            "response": ai_response,
-            "audio": "/voice-response"
-        }
-
-    # --------------------------------------------------------
-    # Ollama
-    #
-    # ask_ollama comes directly from rag.py
-    # --------------------------------------------------------
-
     ollama_start = time.time()
-
-    ai_response = ask_ollama(
-        user_text,
-        context
-    )
-
-    ollama_time = (
-        time.time() - ollama_start
-    )
+    ai_response = ask_ollama(user_text, context)
+    ollama_time = time.time() - ollama_start
 
     print("\nAI:")
     print(ai_response)
-
-    print(
-        f"\nOllama time: "
-        f"{ollama_time:.2f} seconds"
-    )
+    print(f"\nRAG time: {rag_time:.2f} seconds")
+    print(f"Ollama time: {ollama_time:.2f} seconds")
 
     # --------------------------------------------------------
-    # Text → Speech
+    # Text to speech
     # --------------------------------------------------------
-
     piper_start = time.time()
-
     print("\nGenerating voice...")
 
-    with wave.open(
-        OUTPUT_AUDIO,
-        "wb"
-    ) as wav_file:
+    with wave.open(str(OUTPUT_AUDIO), "wb") as wav_file:
+        piper_voice.synthesize_wav(ai_response, wav_file)
 
-        piper_voice.synthesize_wav(
-            ai_response,
-            wav_file
-        )
-
-    piper_time = (
-        time.time() - piper_start
-    )
-
+    piper_time = time.time() - piper_start
     print("Voice generated.")
-
-    print(
-        f"Piper generation time: "
-        f"{piper_time:.2f} seconds"
-    )
+    print(f"Piper generation time: {piper_time:.2f} seconds")
 
     # --------------------------------------------------------
-    # Total Processing Time
+    # Detailed total processing time
     # --------------------------------------------------------
-
-    total_time = (
-        time.time() - total_start
-    )
+    total_time = time.time() - total_start
 
     print("\n" + "-" * 50)
-
-    print(
-        f"Whisper : "
-        f"{whisper_time:.2f}s"
-    )
-
-    print(
-        f"RAG     : "
-        f"{rag_time:.2f}s"
-    )
-
-    print(
-        f"Ollama  : "
-        f"{ollama_time:.2f}s"
-    )
-
-    print(
-        f"Piper   : "
-        f"{piper_time:.2f}s"
-    )
-
-    print(
-        f"TOTAL   : "
-        f"{total_time:.2f}s"
-    )
-
+    print(f"Whisper : {whisper_time:.2f}s")
+    print(f"RAG     : {rag_time:.2f}s")
+    print(f"Ollama  : {ollama_time:.2f}s")
+    print(f"Piper   : {piper_time:.2f}s")
+    print(f"TOTAL   : {total_time:.2f}s")
     print("-" * 50)
     print("=" * 50)
-
-    # --------------------------------------------------------
-    # Return Result
-    # --------------------------------------------------------
 
     return {
         "user_text": user_text,
         "response": ai_response,
-        "audio": "/voice-response"
+        "audio": "/voice-response",
     }
 
 
@@ -539,8 +309,11 @@ async def voice(
 
 @app.get("/voice-response")
 def voice_response():
+    if not OUTPUT_AUDIO.exists():
+        return HTMLResponse("No generated audio is available yet.", status_code=404)
 
     return FileResponse(
-        OUTPUT_AUDIO,
-        media_type="audio/wav"
+        str(OUTPUT_AUDIO),
+        media_type="audio/wav",
+        filename="response.wav",
     )
