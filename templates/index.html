@@ -1,290 +1,565 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI Voice Agent</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Voice Agent</title>
 
-  <style>
-    body {
-      font-family: Arial, sans-serif;
-      max-width: 700px;
-      margin: 40px auto;
-      padding: 0 16px;
-    }
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 700px;
+            margin: 40px auto;
+            padding: 0 16px;
+        }
 
-    h1 {
-      text-align: center;
-    }
+        h1 {
+            text-align: center;
+        }
 
-    #chat {
-      border: 1px solid #ccc;
-      border-radius: 8px;
-      padding: 20px;
-      height: 400px;
-      overflow-y: auto;
-      margin-bottom: 20px;
-    }
+        #chat {
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            padding: 20px;
+            height: 400px;
+            overflow-y: auto;
+            margin-bottom: 20px;
+        }
 
-    .user, .ai {
-      margin: 12px 0;
-      line-height: 1.45;
-      overflow-wrap: anywhere;
-    }
+        .user, .ai {
+            margin: 12px 0;
+            line-height: 1.45;
+            overflow-wrap: anywhere;
+        }
 
-    .controls {
-      display: flex;
-      justify-content: center;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
 
-    button {
-      padding: 12px 20px;
-      font-size: 16px;
-      cursor: pointer;
-      border-radius: 6px;
-    }
+        button {
+            padding: 12px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            border-radius: 6px;
+        }
 
-    button:disabled {
-      cursor: not-allowed;
-      opacity: 0.5;
-    }
+        button:disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
 
-    #status {
-      text-align: center;
-      font-weight: bold;
-      margin: 20px 0;
-      min-height: 1.2em;
-    }
-  </style>
+        #status {
+            text-align: center;
+            font-weight: bold;
+            margin: 20px 0;
+            min-height: 1.2em;
+        }
+    </style>
 </head>
 
 <body>
-  <h1>AI Voice Agent</h1>
+    <h1>AI Voice Agent</h1>
 
-  <div id="chat" aria-live="polite"></div>
+    <div id="chat" aria-live="polite"></div>
 
-  <div class="controls">
-    <button id="startButton">🎤 Start Recording</button>
-    <button id="submitButton" disabled>✓ Submit Question</button>
-  </div>
+    <div class="controls">
+        <button id="startButton">🎤 Start Recording</button>
+        <button id="submitButton" disabled>✓ Submit Question</button>
+    </div>
 
-  <div id="status">
-    Click Start Recording to ask a question.
-  </div>
+    <div id="status">Click Start Recording to ask a question.</div>
 
-  <script>
-    let stream = null;
-    let recorder = null;
-    let chunks = [];
-    let currentAudio = null;
-    let isProcessing = false;
+    <script>
+        // ====================================================
+        // Session
+        // ====================================================
 
-    const startButton = document.getElementById("startButton");
-    const submitButton = document.getElementById("submitButton");
-    const status = document.getElementById("status");
-    const chat = document.getElementById("chat");
+        const SESSION_KEY = "voice_agent_session_id";
 
-    startButton.addEventListener("click", startRecording);
-    submitButton.addEventListener("click", submitRecording);
+        let sessionId = sessionStorage.getItem(SESSION_KEY);
 
-    async function startRecording() {
-      if (isProcessing || (recorder && recorder.state === "recording")) {
-        return;
-      }
+        if (!sessionId) {
+            sessionId = crypto.randomUUID();
+            sessionStorage.setItem(SESSION_KEY, sessionId);
+        }
 
-      try {
-        if (!stream || !stream.active) {
-          stream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true
+        // ====================================================
+        // State
+        // ====================================================
+
+        let microphoneStream = null;
+        let recorder = null;
+        let recordedChunks = [];
+
+        let currentAudio = null;
+        let audioContext = null;
+        let analyser = null;
+        let microphoneSource = null;
+
+        let isRecording = false;
+        let isSpeaking = false;
+        let requestInFlight = false;
+
+        let monitorFrame = null;
+        let playbackToken = 0;
+        let speechStartTime = null;
+
+        const startButton = document.getElementById("startButton");
+        const submitButton = document.getElementById("submitButton");
+        const status = document.getElementById("status");
+        const chat = document.getElementById("chat");
+
+        startButton.addEventListener("click", startRecording);
+        submitButton.addEventListener("click", submitRecording);
+
+        // ====================================================
+        // Microphone
+        // ====================================================
+
+        async function initializeMicrophone() {
+            if (!microphoneStream || !microphoneStream.active) {
+                microphoneStream =
+                    await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true
+                        }
+                    });
             }
-          });
+
+            if (!audioContext) {
+                audioContext = new (
+                    window.AudioContext || window.webkitAudioContext
+                )();
+
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 2048;
+                analyser.smoothingTimeConstant = 0.2;
+
+                microphoneSource =
+                    audioContext.createMediaStreamSource(microphoneStream);
+
+                microphoneSource.connect(analyser);
+            }
+
+            if (audioContext.state === "suspended") {
+                await audioContext.resume();
+            }
         }
 
-        chunks = [];
+        // ====================================================
+        // Recording
+        // ====================================================
 
-        const options = MediaRecorder.isTypeSupported(
-          "audio/webm;codecs=opus"
-        )
-          ? { mimeType: "audio/webm;codecs=opus" }
-          : {};
-
-        recorder = new MediaRecorder(stream, options);
-
-        recorder.addEventListener("dataavailable", (event) => {
-          if (event.data && event.data.size > 0) {
-            chunks.push(event.data);
-          }
-        });
-
-        recorder.start(100);
-
-        startButton.disabled = true;
-        submitButton.disabled = false;
-
-        status.textContent =
-          "🔴Recording in progress...";
-
-      } catch (error) {
-        console.error("Microphone error:", error);
-
-        status.textContent =
-          "❌ Microphone access unavailable. Check permissions.";
-
-        startButton.disabled = false;
-        submitButton.disabled = true;
-      }
-    }
-
-    async function submitRecording() {
-      if (
-        !recorder ||
-        recorder.state !== "recording" ||
-        isProcessing
-      ) {
-        return;
-      }
-
-      isProcessing = true;
-      startButton.disabled = true;
-      submitButton.disabled = true;
-
-      status.textContent =
-        "⏳ Submitting audio and processing your question...";
-
-      const activeRecorder = recorder;
-
-      activeRecorder.addEventListener("stop", async () => {
-        const mimeType = activeRecorder.mimeType || "audio/webm";
-
-        const audioBlob = new Blob(chunks, {
-          type: mimeType
-        });
-
-        chunks = [];
-        recorder = null;
-
-        if (audioBlob.size < 1000) {
-          status.textContent =
-            "⚠️ The recording was too short. Click Start Recording and try again.";
-
-          finishProcessing();
-          return;
-        }
-
-        const formData = new FormData();
-
-        formData.append("file", audioBlob, "voice.webm");
-
-        try {
-          const response = await fetch("/voice", {
-            method: "POST",
-            body: formData
-          });
-
-          if (!response.ok) {
-            throw new Error(`Backend returned ${response.status}`);
-          }
-
-          const data = await response.json();
-
-          if (data.user_text && data.user_text.trim()) {
-            appendMessage("You", data.user_text, "user");
-          }
-
-          if (data.response && data.response.trim()) {
-            appendMessage("AI", data.response, "ai");
-          }
-
-          if (data.audio) {
-            status.textContent = "🔊 Playing response...";
-
-            currentAudio = new Audio(
-              `${data.audio}?t=${Date.now()}`
-            );
-
-            currentAudio.addEventListener("ended", () => {
-              currentAudio = null;
-              finishProcessing();
-
-              status.textContent =
-                "✅ Ready. Click Start Recording for your next question.";
-            }, { once: true });
-
-            currentAudio.addEventListener("error", () => {
-              currentAudio = null;
-              finishProcessing();
-
-              status.textContent =
-                "⚠️ Audio playback failed. Please try again.";
-            }, { once: true });
+        async function startRecording() {
+            if (requestInFlight || isSpeaking || isRecording) {
+                return;
+            }
 
             try {
-              await currentAudio.play();
+                await initializeMicrophone();
+                beginRecording(false);
             } catch (error) {
-              console.error("Audio playback error:", error);
+                console.error("Microphone initialization failed:", error);
 
-              currentAudio = null;
-              finishProcessing();
+                status.textContent =
+                    "Microphone access failed. Check your browser permissions.";
 
-              status.textContent =
-                "⚠️ Unable to play audio. Please try again.";
+                updateButtons();
             }
-
-          } else {
-            finishProcessing();
-
-            status.textContent =
-              "✅ Ready. Click Start Recording for your next question.";
-          }
-
-        } catch (error) {
-          console.error("Voice request failed:", error);
-
-          finishProcessing();
-
-          status.textContent =
-            "❌ Request failed. Please try again.";
         }
 
-      }, { once: true });
+        function beginRecording(interrupted) {
+            if (
+                !microphoneStream ||
+                !microphoneStream.active ||
+                isRecording ||
+                requestInFlight
+            ) {
+                return;
+            }
 
-      activeRecorder.stop();
-    }
+            recordedChunks = [];
 
-    function finishProcessing() {
-      isProcessing = false;
-      startButton.disabled = false;
-      submitButton.disabled = true;
-    }
+            const options = MediaRecorder.isTypeSupported(
+                "audio/webm;codecs=opus"
+            )
+                ? { mimeType: "audio/webm;codecs=opus" }
+                : {};
 
-    function appendMessage(label, message, className) {
-      const wrapper = document.createElement("div");
-      wrapper.className = className;
+            recorder = new MediaRecorder(microphoneStream, options);
 
-      const heading = document.createElement("b");
-      heading.textContent = `${label}: `;
+            recorder.addEventListener("dataavailable", event => {
+                if (event.data && event.data.size > 0) {
+                    recordedChunks.push(event.data);
+                }
+            });
 
-      wrapper.appendChild(heading);
-      wrapper.appendChild(document.createTextNode(message));
+            recorder.start(100);
+            isRecording = true;
 
-      chat.appendChild(wrapper);
-      chat.scrollTop = chat.scrollHeight;
-    }
+            status.textContent = interrupted
+                ? "AI interrupted. Speak, then click Submit Question."
+                : "Recording in progress...";
 
-    window.addEventListener("beforeunload", () => {
-      if (currentAudio) {
-        currentAudio.pause();
-      }
+            updateButtons();
+        }
 
-      if (stream) {
-        stream.getTracks().forEach((track) => track.stop());
-      }
-    });
-  </script>
+        // ====================================================
+        // Submit Recording
+        // ====================================================
+
+        async function submitRecording() {
+            if (
+                !recorder ||
+                recorder.state !== "recording" ||
+                requestInFlight
+            ) {
+                return;
+            }
+
+            requestInFlight = true;
+            isRecording = false;
+
+            const activeRecorder = recorder;
+
+            status.textContent = "Processing your question...";
+            updateButtons();
+
+            activeRecorder.addEventListener("stop", async () => {
+                const mimeType =
+                    activeRecorder.mimeType || "audio/webm";
+
+                const audioBlob = new Blob(recordedChunks, {
+                    type: mimeType
+                });
+
+                recordedChunks = [];
+
+                if (recorder === activeRecorder) {
+                    recorder = null;
+                }
+
+                if (audioBlob.size < 1000) {
+                    requestInFlight = false;
+
+                    status.textContent =
+                        "Recording too short. Please try again.";
+
+                    updateButtons();
+                    return;
+                }
+
+                const formData = new FormData();
+
+                formData.append("file", audioBlob, "voice.webm");
+                formData.append("session_id", sessionId);
+
+                try {
+                    const response = await fetch("/voice", {
+                        method: "POST",
+                        body: formData
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(
+                            `Voice request failed: ${response.status}`
+                        );
+                    }
+
+                    const data = await response.json();
+
+                    if (data.user_text) {
+                        appendMessage("You", data.user_text, "user");
+                    }
+
+                    if (data.response) {
+                        appendMessage("AI", data.response, "ai");
+                    }
+
+                    requestInFlight = false;
+
+                    if (data.audio) {
+                        await playResponse(data.audio);
+                    } else {
+                        status.textContent =
+                            "Ready. Click Start Recording for your next question.";
+                    }
+
+                } catch (error) {
+                    console.error("Voice request failed:", error);
+
+                    requestInFlight = false;
+
+                    status.textContent =
+                        "Request failed. Please try again.";
+
+                } finally {
+                    updateButtons();
+                }
+            }, { once: true });
+
+            activeRecorder.stop();
+        }
+
+        // ====================================================
+        // Playback
+        // ====================================================
+
+        async function playResponse(audioUrl) {
+            playbackToken++;
+            const token = playbackToken;
+
+            stopMicrophoneMonitoring();
+
+            if (currentAudio) {
+                currentAudio.pause();
+                currentAudio.src = "";
+                currentAudio = null;
+            }
+
+            await initializeMicrophone();
+
+            const url = new URL(audioUrl, window.location.href);
+            url.searchParams.set("t", Date.now().toString());
+
+            const audio = new Audio(url.toString());
+            currentAudio = audio;
+
+            isSpeaking = true;
+            speechStartTime = null;
+
+            audio.addEventListener("ended", () => {
+                if (token !== playbackToken) return;
+
+                currentAudio = null;
+                isSpeaking = false;
+
+                stopMicrophoneMonitoring();
+
+                status.textContent =
+                    "Ready. Click Start Recording for your next question.";
+
+                updateButtons();
+            }, { once: true });
+
+            audio.addEventListener("error", () => {
+                if (token !== playbackToken) return;
+
+                currentAudio = null;
+                isSpeaking = false;
+
+                stopMicrophoneMonitoring();
+
+                status.textContent =
+                    "Audio playback failed. Please try again.";
+
+                updateButtons();
+            }, { once: true });
+
+            // Start monitoring while the AI response plays.
+            startMicrophoneMonitoring(token);
+
+            status.textContent =
+                "AI is speaking. You can interrupt by talking.";
+
+            updateButtons();
+
+            try {
+                await audio.play();
+            } catch (error) {
+                if (token !== playbackToken) return;
+
+                console.error("Playback failed:", error);
+
+                isSpeaking = false;
+                currentAudio = null;
+
+                stopMicrophoneMonitoring();
+
+                status.textContent =
+                    "Unable to play the response.";
+
+                updateButtons();
+            }
+        }
+
+        // ====================================================
+        // Interruption Detection
+        // ====================================================
+
+        function startMicrophoneMonitoring(token) {
+            if (!analyser) return;
+
+            const samples = new Float32Array(analyser.fftSize);
+
+            // Ignore initial playback transients.
+            const monitorStartedAt = performance.now();
+
+            // Thresholds are detector settings, not speech corrections.
+            const minimumRms = 0.035;
+            const sustainedSpeechMs = 600;
+            const startupDelayMs = 700;
+
+            function inspectMicrophone() {
+                if (
+                    !isSpeaking ||
+                    token !== playbackToken ||
+                    !analyser
+                ) {
+                    return;
+                }
+
+                analyser.getFloatTimeDomainData(samples);
+
+                let sumSquares = 0;
+                let zeroCrossings = 0;
+
+                for (let i = 0; i < samples.length; i++) {
+                    sumSquares += samples[i] * samples[i];
+
+                    if (i > 0) {
+                        const crossedZero =
+                            (samples[i] >= 0 && samples[i - 1] < 0) ||
+                            (samples[i] < 0 && samples[i - 1] >= 0);
+
+                        if (crossedZero) zeroCrossings++;
+                    }
+                }
+
+                const rms = Math.sqrt(
+                    sumSquares / samples.length
+                );
+
+                const zeroCrossingRate =
+                    zeroCrossings / samples.length;
+
+                const elapsed =
+                    performance.now() - monitorStartedAt;
+
+                const speechLike =
+                    rms > minimumRms &&
+                    zeroCrossingRate > 0.015 &&
+                    zeroCrossingRate < 0.35;
+
+                if (elapsed > startupDelayMs && speechLike) {
+                    if (speechStartTime === null) {
+                        speechStartTime = performance.now();
+                    }
+
+                    const speechDuration =
+                        performance.now() - speechStartTime;
+
+                    if (speechDuration >= sustainedSpeechMs) {
+                        interruptPlayback();
+                        return;
+                    }
+                } else {
+                    speechStartTime = null;
+                }
+
+                monitorFrame =
+                    requestAnimationFrame(inspectMicrophone);
+            }
+
+            monitorFrame =
+                requestAnimationFrame(inspectMicrophone);
+        }
+
+        function interruptPlayback() {
+            if (!isSpeaking) return;
+
+            console.log("User interruption detected.");
+
+            // Invalidate old playback events before stopping audio.
+            playbackToken++;
+
+            stopMicrophoneMonitoring();
+
+            if (currentAudio) {
+                currentAudio.pause();
+                currentAudio.currentTime = 0;
+                currentAudio.src = "";
+                currentAudio = null;
+            }
+
+            isSpeaking = false;
+
+            // Begin capturing the user's interruption.
+            beginRecording(true);
+        }
+
+        function stopMicrophoneMonitoring() {
+            if (monitorFrame !== null) {
+                cancelAnimationFrame(monitorFrame);
+                monitorFrame = null;
+            }
+
+            speechStartTime = null;
+        }
+
+        // ====================================================
+        // UI Helpers
+        // ====================================================
+
+        function updateButtons() {
+            startButton.disabled =
+                requestInFlight || isSpeaking || isRecording;
+
+            submitButton.disabled =
+                !isRecording ||
+                !recorder ||
+                recorder.state !== "recording";
+        }
+
+        function appendMessage(label, message, className) {
+            const wrapper = document.createElement("div");
+            wrapper.className = className;
+
+            const heading = document.createElement("b");
+            heading.textContent = `${label}: `;
+
+            wrapper.appendChild(heading);
+            wrapper.appendChild(
+                document.createTextNode(message)
+            );
+
+            chat.appendChild(wrapper);
+            chat.scrollTop = chat.scrollHeight;
+        }
+
+        // ====================================================
+        // Cleanup
+        // ====================================================
+
+        window.addEventListener("beforeunload", () => {
+            playbackToken++;
+
+            stopMicrophoneMonitoring();
+
+            if (currentAudio) {
+                currentAudio.pause();
+            }
+
+            if (recorder && recorder.state === "recording") {
+                recorder.stop();
+            }
+
+            if (microphoneStream) {
+                microphoneStream.getTracks().forEach(track => {
+                    track.stop();
+                });
+            }
+
+            if (audioContext && audioContext.state !== "closed") {
+                audioContext.close();
+            }
+        });
+    </script>
 </body>
 </html>
