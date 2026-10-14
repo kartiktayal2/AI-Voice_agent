@@ -27,7 +27,7 @@ app = FastAPI()
 
 BASE_DIR = Path(__file__).resolve().parent
 
-WHISPER_MODEL = "distil-small.en"
+WHISPER_MODEL = "distil-medium.en"
 
 # Piper
 PIPER_MODEL = str(BASE_DIR / "en_US-lessac-medium.onnx")
@@ -45,7 +45,7 @@ CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Local Ollama
 OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "qwen2.5:0.5b"
+OLLAMA_MODEL = "llama3.2:latest"
 
 # Protect conversation-file operations within this process.
 conversation_lock = Lock()
