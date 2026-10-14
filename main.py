@@ -24,7 +24,7 @@ AUDIO_DIR = BASE_DIR / "audio"
 INPUT_AUDIO = AUDIO_DIR / "browser_input.webm"
 OUTPUT_AUDIO = AUDIO_DIR / "browser_response.wav"
 
-WHISPER_MODEL = "distil-small.en"
+WHISPER_MODEL = "distil-medium.en"
 PIPER_MODEL = BASE_DIR / "en_US-lessac-medium.onnx"
 
 app = FastAPI(title="Loan Policy Voice Assistant")

@@ -21,7 +21,7 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "qwen2.5:0.5b"
+OLLAMA_MODEL = "llama3.2:latest"
 
 RETRIEVAL_TOP_K = 12
 FINAL_TOP_K = 5
